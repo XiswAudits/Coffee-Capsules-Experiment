@@ -1,0 +1,1 @@
+Source: user-supplied 11-week coffee capsule dataset. Choice = Regular if regular quantity > 0; Premium if premium quantity > 0; No Purchase if both quantities are 0.
