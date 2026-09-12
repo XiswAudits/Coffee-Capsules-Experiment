@@ -5,13 +5,12 @@ import plotly.graph_objects as go
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import accuracy_score
 
-st.set_page_config(page_title="Coffee Capsule Demand", page_icon="☕", layout="wide", initial_sidebar_state="expanded")
+st.set_page_config(page_title="Coffee Capsule Demand", page_icon="☕", layout="wide")
 
 # -----------------------------------------------------------------------------
-# Data
+# Data and labels
 # -----------------------------------------------------------------------------
-DATA_PATH = "coffee_capsules_data.csv"
-RAW = pd.read_csv(DATA_PATH)
+RAW = pd.read_csv("coffee_capsules_data.csv")
 HOUSEHOLDS = {
     "Household 1": ("HH1_Regular", "HH1_Premium"),
     "Household 2": ("HH2_Regular", "HH2_Premium"),
@@ -23,19 +22,25 @@ POINTS = {"Regular": "#2563EB", "Premium": "#D89B00", "No Purchase": "#64748B"}
 
 def build_observations():
     rows = []
-    for hh, (reg_col, prem_col) in HOUSEHOLDS.items():
-        for _, r in RAW.iterrows():
-            reg_q, prem_q = int(r[reg_col]), int(r[prem_col])
-            choice = "Regular" if reg_q > 0 else "Premium" if prem_q > 0 else "No Purchase"
+    for household, (regular_col, premium_col) in HOUSEHOLDS.items():
+        for _, row in RAW.iterrows():
+            regular_q = int(row[regular_col])
+            premium_q = int(row[premium_col])
+            if regular_q > 0:
+                choice = "Regular"
+            elif premium_q > 0:
+                choice = "Premium"
+            else:
+                choice = "No Purchase"
             rows.append({
-                "Household": hh,
-                "T": int(r["T"]),
-                "P_Regular": float(r["P_Regular"]),
-                "P_Premium": float(r["P_Premium"]),
-                "Regular": reg_q,
-                "Premium": prem_q,
+                "Household": household,
+                "T": int(row["T"]),
+                "P_Regular": float(row["P_Regular"]),
+                "P_Premium": float(row["P_Premium"]),
+                "Regular": regular_q,
+                "Premium": premium_q,
                 "Choice": choice,
-                "Quantity": reg_q + prem_q,
+                "Quantity": regular_q + premium_q,
             })
     return pd.DataFrame(rows)
 
@@ -43,272 +48,309 @@ def build_observations():
 OBS = build_observations()
 
 # -----------------------------------------------------------------------------
-# Two-stage linear classification model
+# Proposed classification model
+#
+# The behavioral process is modeled in two stages:
+#   1) Buy vs. No Purchase
+#   2) Conditional on buying: Regular vs. Premium
+#
+# Both are logistic classifiers. Since the inputs are prices, each 50% contour is
+# a straight line in the P_R / P_P plane. Household indicators allow the pooled
+# experiment to account for systematic household differences.
 # -----------------------------------------------------------------------------
-# Stage 1: purchase vs. no purchase.
-# Stage 2: Regular vs. Premium, conditional on purchasing.
-# Both are logistic classifiers, so their boundaries are linear in (P_R, P_P).
-# Household indicators allow the pooled model to retain household heterogeneity.
-
-PR_MEAN, PR_STD = OBS.P_Regular.mean(), OBS.P_Regular.std(ddof=0)
-PP_MEAN, PP_STD = OBS.P_Premium.mean(), OBS.P_Premium.std(ddof=0)
+PR_MEAN = OBS["P_Regular"].mean()
+PR_STD = OBS["P_Regular"].std(ddof=0)
+PP_MEAN = OBS["P_Premium"].mean()
+PP_STD = OBS["P_Premium"].std(ddof=0)
 
 
 def features(frame):
     return np.column_stack([
-        (frame.P_Regular.values - PR_MEAN) / PR_STD,
-        (frame.P_Premium.values - PP_MEAN) / PP_STD,
-        (frame.Household == "Household 2").astype(float),
-        (frame.Household == "Household 3").astype(float),
+        (frame["P_Regular"].to_numpy() - PR_MEAN) / PR_STD,
+        (frame["P_Premium"].to_numpy() - PP_MEAN) / PP_STD,
+        (frame["Household"] == "Household 2").astype(float).to_numpy(),
+        (frame["Household"] == "Household 3").astype(float).to_numpy(),
     ])
 
 
-PURCHASE_Y = (OBS.Choice != "No Purchase").astype(int).values
-PURCHASE_MODEL = LogisticRegression(C=1.0, max_iter=5000).fit(features(OBS), PURCHASE_Y)
+purchase_y = (OBS["Choice"] != "No Purchase").astype(int).to_numpy()
+purchase_model = LogisticRegression(C=1.0, max_iter=5000).fit(features(OBS), purchase_y)
 
-BUYERS = OBS[OBS.Choice != "No Purchase"].copy()
-CHOICE_Y = (BUYERS.Choice == "Premium").astype(int).values
-CHOICE_MODEL = LogisticRegression(C=1.0, max_iter=5000).fit(features(BUYERS), CHOICE_Y)
-
-OBS["Purchase prediction"] = np.where(PURCHASE_MODEL.predict(features(OBS)) == 1, "Buy", "No Purchase")
-OBS["Choice prediction"] = np.where(CHOICE_MODEL.predict(features(OBS)) == 1, "Premium", "Regular")
-OBS["Model prediction"] = np.where(OBS["Purchase prediction"] == "No Purchase", "No Purchase", OBS["Choice prediction"])
+BUYERS = OBS[OBS["Choice"] != "No Purchase"].copy()
+choice_y = (BUYERS["Choice"] == "Premium").astype(int).to_numpy()
+choice_model = LogisticRegression(C=1.0, max_iter=5000).fit(features(BUYERS), choice_y)
 
 
-def household_frame(hh):
-    return OBS[OBS.Household == hh].copy()
-
-
-def probs(hh, pr, pp):
-    x = pd.DataFrame({"Household": [hh], "P_Regular": [pr], "P_Premium": [pp]})
-    purchase_p = PURCHASE_MODEL.predict_proba(features(x))[0, 1]
-    premium_p = CHOICE_MODEL.predict_proba(features(x))[0, 1]
-    # Joint three-state probabilities implied by the two-stage structure.
+def probabilities(household, p_regular, p_premium):
+    x = pd.DataFrame({
+        "Household": [household],
+        "P_Regular": [p_regular],
+        "P_Premium": [p_premium],
+    })
+    p_buy = purchase_model.predict_proba(features(x))[0, 1]
+    p_premium_given_buy = choice_model.predict_proba(features(x))[0, 1]
     return {
-        "No Purchase": 1 - purchase_p,
-        "Regular": purchase_p * (1 - premium_p),
-        "Premium": purchase_p * premium_p,
-        "purchase": purchase_p,
-        "premium_given_purchase": premium_p,
+        "No Purchase": 1.0 - p_buy,
+        "Regular": p_buy * (1.0 - p_premium_given_buy),
+        "Premium": p_buy * p_premium_given_buy,
     }
 
 
-def line_for(model, hh):
-    # Model: sigmoid(b0 + bR*zR + bP*zP + bHH2*HH2 + bHH3*HH3).
-    b = model.coef_[0]
+def boundary(model, household):
+    """Return P_P = slope * P_R + intercept for the model's 50% contour."""
+    coef = model.coef_[0]
     intercept = model.intercept_[0]
-    hh_effect = b[2] if hh == "Household 2" else b[3] if hh == "Household 3" else 0.0
-    # zP = slope_z * zR + intercept_z
-    slope_z = -b[0] / b[1]
-    intercept_z = -(intercept + hh_effect) / b[1]
-    # PP = slope_raw * PR + intercept_raw
-    slope_raw = slope_z * PP_STD / PR_STD
-    intercept_raw = PP_MEAN + PP_STD * intercept_z - slope_raw * PR_MEAN
-    return slope_raw, intercept_raw
+    household_effect = 0.0
+    if household == "Household 2":
+        household_effect = coef[2]
+    elif household == "Household 3":
+        household_effect = coef[3]
+
+    # b0 + bR*zR + bP*zP + household_effect = 0
+    if abs(coef[1]) < 1e-12:
+        return np.nan, np.nan
+    slope_z = -coef[0] / coef[1]
+    intercept_z = -(intercept + household_effect) / coef[1]
+    slope = slope_z * PP_STD / PR_STD
+    raw_intercept = PP_MEAN + PP_STD * intercept_z - slope * PR_MEAN
+    return slope, raw_intercept
 
 
-def decision_map(hh, sim_pr, sim_pp):
-    xlo, xhi = 30, 70
-    ylo, yhi = 65, 105
-    xs = np.linspace(xlo, xhi, 180)
-    ys = np.linspace(ylo, yhi, 180)
+def decision_map(household, scenario_regular, scenario_premium):
+    x_min, x_max = 30, 70
+    y_min, y_max = 65, 105
+    xs = np.linspace(x_min, x_max, 180)
+    ys = np.linspace(y_min, y_max, 180)
     xx, yy = np.meshgrid(xs, ys)
-    grid = pd.DataFrame({"Household": hh, "P_Regular": xx.ravel(), "P_Premium": yy.ravel()})
-    purchase_prob = PURCHASE_MODEL.predict_proba(features(grid))[:, 1].reshape(xx.shape)
-    premium_prob = CHOICE_MODEL.predict_proba(features(grid))[:, 1].reshape(xx.shape)
-    # Encode final choice: 0 Regular, 1 Premium, 2 No Purchase.
-    zone = np.where(purchase_prob < 0.5, 2, np.where(premium_prob >= 0.5, 1, 0))
+    grid = pd.DataFrame({
+        "Household": household,
+        "P_Regular": xx.ravel(),
+        "P_Premium": yy.ravel(),
+    })
+
+    p_buy = purchase_model.predict_proba(features(grid))[:, 1].reshape(xx.shape)
+    p_premium = choice_model.predict_proba(features(grid))[:, 1].reshape(xx.shape)
+    # 0 = Regular, 1 = Premium, 2 = No Purchase
+    zones = np.where(p_buy < 0.5, 2, np.where(p_premium >= 0.5, 1, 0))
 
     fig = go.Figure()
     fig.add_trace(go.Heatmap(
-        x=xs, y=ys, z=zone,
-        zmin=0, zmax=2,
+        x=xs, y=ys, z=zones, zmin=0, zmax=2,
         colorscale=[
-            [0.00, "rgba(37,99,235,0.09)"], [0.33, "rgba(37,99,235,0.09)"],
+            [0.00, "rgba(37,99,235,0.10)"], [0.33, "rgba(37,99,235,0.10)"],
             [0.34, "rgba(216,155,0,0.10)"], [0.66, "rgba(216,155,0,0.10)"],
             [0.67, "rgba(100,116,139,0.10)"], [1.00, "rgba(100,116,139,0.10)"],
-        ], showscale=False, hoverinfo="skip", name="Decision zones"
+        ], showscale=False, hoverinfo="skip"
     ))
 
-    pm, pb = line_for(PURCHASE_MODEL, hh)
-    cm, cb = line_for(CHOICE_MODEL, hh)
-    purchase_y = pm * xs + pb
-    choice_y = cm * xs + cb
-    mask_p = (purchase_y >= ylo) & (purchase_y <= yhi)
-    mask_c = (choice_y >= ylo) & (choice_y <= yhi)
+    purchase_slope, purchase_intercept = boundary(purchase_model, household)
+    choice_slope, choice_intercept = boundary(choice_model, household)
+    purchase_line = purchase_slope * xs + purchase_intercept
+    choice_line = choice_slope * xs + choice_intercept
 
-    fig.add_trace(go.Scatter(
-        x=xs[mask_p], y=purchase_y[mask_p], mode="lines", name="Purchase boundary",
-        line=dict(color="#111827", width=3, dash="dash"),
-        hovertemplate="Purchase boundary<br>P<sub>P</sub>=%{y:.1f}<extra></extra>"
-    ))
-    fig.add_trace(go.Scatter(
-        x=xs[mask_c], y=choice_y[mask_c], mode="lines", name="Regular / Premium boundary",
-        line=dict(color="#111827", width=3),
-        hovertemplate="Regular / Premium boundary<br>P<sub>P</sub>=%{y:.1f}<extra></extra>"
-    ))
+    purchase_mask = (purchase_line >= y_min) & (purchase_line <= y_max)
+    choice_mask = (choice_line >= y_min) & (choice_line <= y_max)
 
-    h = household_frame(hh)
-    for choice in CHOICES:
-        s = h[h.Choice == choice]
-        if s.empty:
-            continue
+    if purchase_mask.any():
         fig.add_trace(go.Scatter(
-            x=s.P_Regular, y=s.P_Premium, mode="markers", name=choice,
-            marker=dict(size=12, color=POINTS[choice], line=dict(color="white", width=1.5)),
-            customdata=np.c_[s.T, s.Quantity],
-            hovertemplate=("<b>%{fullData.name}</b><br>Week %{customdata[0]}<br>"
-                           "P<sub>R</sub>=%{x:.0f}<br>P<sub>P</sub>=%{y:.0f}<br>"
-                           "Quantity=%{customdata[1]}<extra></extra>"),
+            x=xs[purchase_mask], y=purchase_line[purchase_mask],
+            mode="lines", name="Purchase boundary",
+            line=dict(color="#111827", width=3, dash="dash"),
+            hovertemplate="Purchase boundary<br>P<sub>P</sub>=%{y:.1f}<extra></extra>",
+        ))
+    if choice_mask.any():
+        fig.add_trace(go.Scatter(
+            x=xs[choice_mask], y=choice_line[choice_mask],
+            mode="lines", name="Regular / Premium boundary",
+            line=dict(color="#111827", width=3),
+            hovertemplate="Regular / Premium boundary<br>P<sub>P</sub>=%{y:.1f}<extra></extra>",
         ))
 
-    p = probs(hh, sim_pr, sim_pp)
-    final = max(CHOICES, key=lambda k: p[k])
+    household_data = OBS[OBS["Household"] == household]
+    for choice in CHOICES:
+        sample = household_data[household_data["Choice"] == choice]
+        if sample.empty:
+            continue
+        # IMPORTANT: use the actual T column. DataFrame.T means transpose in pandas.
+        customdata = sample[["T", "Quantity"]].to_numpy()
+        fig.add_trace(go.Scatter(
+            x=sample["P_Regular"], y=sample["P_Premium"],
+            mode="markers", name=choice,
+            marker=dict(size=12, color=POINTS[choice], line=dict(color="white", width=1.5)),
+            customdata=customdata,
+            hovertemplate=(
+                "<b>%{fullData.name}</b><br>Week %{customdata[0]}<br>"
+                "P<sub>R</sub>=%{x:.0f}<br>P<sub>P</sub>=%{y:.0f}<br>"
+                "Quantity=%{customdata[1]}<extra></extra>"
+            ),
+        ))
+
+    scenario_probs = probabilities(household, scenario_regular, scenario_premium)
+    predicted = max(CHOICES, key=scenario_probs.get)
     fig.add_trace(go.Scatter(
-        x=[sim_pr], y=[sim_pp], mode="markers", name="Your scenario",
-        marker=dict(symbol="star", size=19, color="#111827", line=dict(color="white", width=2)),
-        hovertemplate=(f"<b>Your scenario</b><br>P<sub>R</sub>={sim_pr:.0f}<br>"
-                       f"P<sub>P</sub>={sim_pp:.0f}<br>Most likely: {final}<extra></extra>")
+        x=[scenario_regular], y=[scenario_premium], mode="markers",
+        name="Your scenario",
+        marker=dict(symbol="star", size=20, color="#111827", line=dict(color="white", width=2)),
+        hovertemplate=(
+            f"<b>Your scenario</b><br>P<sub>R</sub>={scenario_regular:.0f}<br>"
+            f"P<sub>P</sub>={scenario_premium:.0f}<br>Most likely: {predicted}<extra></extra>"
+        ),
     ))
+
     fig.update_layout(
-        height=590, margin=dict(l=15, r=15, t=15, b=15),
+        height=600, margin=dict(l=10, r=10, t=20, b=10),
         paper_bgcolor="white", plot_bgcolor="white",
-        xaxis=dict(title="Regular price (P_R)", range=[xlo, xhi], gridcolor="#E5E7EB", zeroline=False),
-        yaxis=dict(title="Premium price (P_P)", range=[ylo, yhi], gridcolor="#E5E7EB", zeroline=False),
+        xaxis=dict(title="Regular capsule price (P_R)", range=[x_min, x_max], gridcolor="#E5E7EB", zeroline=False),
+        yaxis=dict(title="Premium capsule price (P_P)", range=[y_min, y_max], gridcolor="#E5E7EB", zeroline=False),
         legend=dict(orientation="h", yanchor="bottom", y=1.01, x=0),
         hoverlabel=dict(bgcolor="white"),
     )
-    return fig, p, (pm, pb), (cm, cb)
+    return fig, scenario_probs, (purchase_slope, purchase_intercept), (choice_slope, choice_intercept)
 
 
 # -----------------------------------------------------------------------------
-# UI
+# Styling
 # -----------------------------------------------------------------------------
 st.markdown("""
 <style>
-:root { --ink:#172033; --muted:#667085; --line:#E7E9EE; --paper:#FFFFFF; --soft:#F7F8FA; }
-.block-container { max-width: 1320px; padding-top: 1.6rem; padding-bottom: 3rem; }
-section[data-testid="stSidebar"] { border-right: 1px solid #E7E9EE; }
-.hero { background: linear-gradient(135deg,#FFFDF7 0%,#F7F8FA 100%); border:1px solid #E7E9EE;
-        border-radius:24px; padding:30px 34px; margin-bottom:22px; }
-.kicker { font-size:.78rem; letter-spacing:.12em; text-transform:uppercase; font-weight:700; color:#667085; margin-bottom:7px; }
-.hero h1 { color:#172033; font-size:2.55rem; line-height:1.05; letter-spacing:-.045em; margin:0 0 10px 0; }
-.hero p { color:#667085; font-size:1.03rem; margin:0; max-width:850px; }
-.section-note { color:#667085; font-size:.93rem; margin-top:-8px; }
-.callout { border-left:4px solid #172033; background:#F7F8FA; padding:14px 17px; border-radius:0 12px 12px 0; }
-[data-testid="stMetric"] { border:1px solid #E7E9EE; border-radius:16px; padding:14px 16px; background:#fff; }
+.block-container {max-width:1320px; padding-top:1.5rem; padding-bottom:3rem;}
+section[data-testid="stSidebar"] {border-right:1px solid #E7E9EE;}
+.hero {background:linear-gradient(135deg,#FFFDF7 0%,#F7F8FA 100%); border:1px solid #E7E9EE;
+       border-radius:24px; padding:30px 34px; margin-bottom:22px;}
+.kicker {font-size:.76rem; letter-spacing:.13em; text-transform:uppercase; font-weight:700; color:#667085; margin-bottom:8px;}
+.hero h1 {color:#172033; font-size:2.5rem; line-height:1.06; letter-spacing:-.045em; margin:0 0 10px;}
+.hero p {color:#667085; font-size:1.03rem; margin:0; max-width:880px;}
+.note {color:#667085; font-size:.92rem; margin-top:-8px;}
+.callout {border-left:4px solid #172033; background:#F7F8FA; padding:14px 17px; border-radius:0 12px 12px 0;}
+[data-testid="stMetric"] {border:1px solid #E7E9EE; border-radius:16px; padding:14px 16px; background:#fff;}
 </style>
 """, unsafe_allow_html=True)
 
+# -----------------------------------------------------------------------------
+# Controls
+# -----------------------------------------------------------------------------
 with st.sidebar:
     st.markdown("### ☕ Coffee Capsule Lab")
-    st.caption("A small choice experiment, made easier to explore.")
-    hh = st.selectbox("Household", list(HOUSEHOLDS))
+    st.caption("Explore how the two prices shape household choice.")
+    household = st.selectbox("Household", list(HOUSEHOLDS))
     st.divider()
     st.markdown("**Try a price scenario**")
-    sim_pr = st.slider("Regular price (P_R)", 30, 70, 42)
-    sim_pp = st.slider("Premium price (P_P)", 65, 105, 93)
+    scenario_regular = st.slider("Regular price (P_R)", 30, 70, 42)
+    scenario_premium = st.slider("Premium price (P_P)", 65, 105, 93)
     st.divider()
-    st.caption("The model uses all 33 household-week observations. Household indicators are included so the pooled classifier can capture systematic differences between households.")
+    st.caption("The model pools all 33 household-week observations and includes household indicators.")
 
-fig, p, purchase_line, choice_line = decision_map(hh, sim_pr, sim_pp)
-pred = max(CHOICES, key=lambda k: p[k])
+fig, scenario_probs, purchase_boundary, choice_boundary = decision_map(
+    household, scenario_regular, scenario_premium
+)
+prediction = max(CHOICES, key=scenario_probs.get)
 
 st.markdown("""
 <div class="hero">
   <div class="kicker">Coffee capsule experiment</div>
   <h1>How price changes the household's choice</h1>
-  <p>Move the prices on the left and see how the model separates <b>buying</b> from <b>not buying</b>, then Regular from Premium.</p>
+  <p>Change the two prices on the left. The map shows the observed choices and the model's estimated regions for <b>Regular</b>, <b>Premium</b>, and <b>No Purchase</b>.</p>
 </div>
 """, unsafe_allow_html=True)
 
-c1,c2,c3,c4 = st.columns(4)
-c1.metric("Most likely choice", pred)
-c2.metric("P(Regular)", f"{p['Regular']:.0%}")
-c3.metric("P(Premium)", f"{p['Premium']:.0%}")
-c4.metric("P(No purchase)", f"{p['No Purchase']:.0%}")
+m1, m2, m3, m4 = st.columns(4)
+m1.metric("Most likely choice", prediction)
+m2.metric("P(Regular)", f"{scenario_probs['Regular']:.0%}")
+m3.metric("P(Premium)", f"{scenario_probs['Premium']:.0%}")
+m4.metric("P(No purchase)", f"{scenario_probs['No Purchase']:.0%}")
 
 st.markdown("### The decision map")
-st.markdown(f'<div class="section-note">{hh} · observed weekly choices + fitted decision regions · the star is your current price scenario</div>', unsafe_allow_html=True)
+st.markdown(
+    f'<div class="note">{household} · observed weekly choices + fitted decision regions · ★ = your current scenario</div>',
+    unsafe_allow_html=True,
+)
 st.plotly_chart(fig, use_container_width=True, config={"displaylogo": False, "scrollZoom": True})
 
-with st.expander("What are the two lines?", expanded=False):
+with st.expander("How to read the two boundaries"):
     st.markdown("""
-**Dashed line — purchase boundary.** This is the 50% contour of the purchase classifier. Crossing it changes the model's most likely outcome between buying and no purchase.
+**Dashed line — purchase boundary.** This is the 50% contour from the first-stage classifier. It separates the model's buying and no-purchase regions.
 
-**Solid line — Regular / Premium boundary.** This is the 50% contour of the product-choice classifier and is applied only after the household is predicted to buy.
+**Solid line — Regular / Premium boundary.** This is the 50% contour from the second-stage classifier. It is interpreted conditional on the household buying.
 
-That gives the model the three behavioral outcomes without pretending that Regular, Premium and No Purchase are three equally observed alternatives inside every household.
+So the model is not forcing all three outcomes into a single household-specific line. It reflects the sequence of decisions in the experiment: **buy or not → Regular or Premium**.
 """)
 
-st.markdown("### Why this is a good fit for the model we propose")
+st.markdown("### Why this classification approach fits the proposed model")
 st.markdown("""
-The experiment is fundamentally a **classification problem in a two-price space**. For every household-week we observe two explanatory variables — the Regular price and the Premium price — and an observed behavioral outcome.
+The experiment gives us a natural classification setting: each household-week has two observable price inputs — **P_R** and **P_P** — and a behavioral outcome. A linear logistic classifier is a sensible first model because it turns those prices into probabilities while keeping the decision boundary visible on the same two-dimensional map.
 
-A **linear logistic classifier** is a useful first model here because its decision boundary is easy to see and explain: a combination of the two prices maps to a probability of purchase or a probability of choosing Premium conditional on purchase. The 50% probability contour is a straight line in the price plane. That makes the economics intuitive without hiding the model behind a black box.
+The two-stage formulation is especially useful because **No Purchase is a different decision from choosing between two products**. First, a household decides whether the prices are acceptable enough to buy at all. If it buys, it then chooses between Regular and Premium. This mirrors the observed behavior much better than fitting a Regular-vs-Premium classifier and treating missing purchases as if they were another product choice.
 
-The important detail is the **two-stage structure**:
-
-1. **Purchase decision:** buy coffee capsules vs. no purchase.
-2. **Product decision:** conditional on buying, Regular vs. Premium.
-
-This matches the behavior we actually observe. It also solves the issue that the original household-by-household binary classifier could not show a meaningful no-purchase region for Household 1 or 2, or a Regular/Premium boundary for Household 3.
+It is also transparent. The 50% contours are straight lines, so the model can be explained directly in terms of combinations of the two prices rather than relying on a black-box prediction. At the same time, pooling the observations and adding household indicators lets us use information from the complete experiment when an individual household does not contain all possible outcomes.
 """)
+st.markdown(
+    '<div class="callout"><b>Why Household 3 now has a No Purchase region</b><br>'
+    'Household 3 has 7 Premium weeks, 4 No Purchase weeks, and 0 Regular weeks. The old app only estimated a Regular-vs-Premium classifier, so it had no model for the purchase decision. The revised first stage explicitly models Buy vs. No Purchase, which is why the graph can now show a No Purchase region. The Regular/Premium boundary is learned from the purchasing observations across the experiment; it should not be interpreted as evidence that Household 3 itself ever chose Regular.</div>',
+    unsafe_allow_html=True,
+)
 
-st.markdown('<div class="callout"><b>Why not just fit one three-class line?</b><br>The data are sparse and unbalanced at the household level. Household 3 never buys Regular, while Household 1 and 2 never record a no-purchase week. A single household-specific three-class model would therefore be asking the data to identify choices that were never observed. The pooled two-stage model uses the full experiment while keeping the interpretation straightforward.</div>', unsafe_allow_html=True)
-
-st.markdown("### What the model is saying")
-cc1,cc2 = st.columns(2)
-with cc1:
+st.markdown("### What the model says for this scenario")
+b1, b2 = st.columns(2)
+with b1:
+    ps, pi = purchase_boundary
     st.markdown("**Purchase stage**")
-    st.write(f"For {hh}, the estimated purchase boundary is approximately `P_P = {purchase_line[0]:.3f} × P_R + {purchase_line[1]:.2f}`.")
-    st.caption("Crossing this line changes the model's most likely outcome between purchase and no purchase.")
-with cc2:
+    st.write(f"Estimated 50% boundary: `P_P = {ps:.3f} × P_R + {pi:.2f}`")
+    st.caption("This line describes the transition between buying and not buying.")
+with b2:
+    cs, ci = choice_boundary
     st.markdown("**Product stage**")
-    st.write(f"Conditional on buying, the Regular/Premium boundary is approximately `P_P = {choice_line[0]:.3f} × P_R + {choice_line[1]:.2f}`.")
-    st.caption("This line only has a behavioral meaning inside the purchase region.")
+    st.write(f"Estimated 50% boundary: `P_P = {cs:.3f} × P_R + {ci:.2f}`")
+    st.caption("This line describes Regular vs. Premium conditional on buying.")
 
 # -----------------------------------------------------------------------------
-# Insights
+# Supporting sections
 # -----------------------------------------------------------------------------
-t1,t2,t3 = st.tabs(["Household insights", "Data & validation", "Model notes"])
+t1, t2, t3 = st.tabs(["Household insights", "Data & validation", "Model notes"])
+
 with t1:
-    h = household_frame(hh)
-    counts = h.Choice.value_counts().reindex(CHOICES).fillna(0).astype(int)
-    a,b,c = st.columns(3)
-    a.metric("Regular weeks", counts["Regular"])
-    b.metric("Premium weeks", counts["Premium"])
-    c.metric("No-purchase weeks", counts["No Purchase"])
+    h = OBS[OBS["Household"] == household]
+    counts = h["Choice"].value_counts().reindex(CHOICES).fillna(0).astype(int)
+    a, b, c = st.columns(3)
+    a.metric("Regular weeks", int(counts["Regular"]))
+    b.metric("Premium weeks", int(counts["Premium"]))
+    c.metric("No-purchase weeks", int(counts["No Purchase"]))
+
     st.markdown("#### Observed behavior")
-    if hh == "Household 1":
-        st.write("Household 1 is mostly Regular-oriented, with Premium appearing when the relative price relationship becomes more attractive. There is no observed no-purchase week, so the purchase boundary is learned from the pooled experiment rather than from Household 1 alone.")
-    elif hh == "Household 2":
-        st.write("Household 2 switches between Regular and Premium, but likewise has no observed no-purchase week. The model therefore uses the pooled purchase response to draw the no-purchase region and household-specific effects to shift it.")
+    if household == "Household 1":
+        st.write("Household 1 is mostly Regular-oriented and switches to Premium in the weeks where the relative price relationship becomes more attractive. There is no observed No Purchase week, so the purchase stage necessarily borrows information from the pooled experiment.")
+    elif household == "Household 2":
+        st.write("Household 2 switches between Regular and Premium, with Premium appearing in four observed weeks. There is no observed No Purchase week, so the no-purchase region is identified from the pooled purchase response rather than from Household 2 alone.")
     else:
-        st.write("Household 3 is the key reason the two-stage model is useful: it has Premium purchases and no-purchase observations, but no Regular purchases. The graph can still show a no-purchase region, while the Regular/Premium comparison is learned from purchasing households and should not be read as directly observed Regular behavior for Household 3.")
+        st.write("Household 3 is the clearest illustration of why the two-stage structure helps. It has Premium purchases and No Purchase observations, but no Regular purchases. The first stage can therefore describe purchase vs. non-purchase while the second stage describes the product choice using the purchasing sample.")
+
     st.markdown("#### Quantity when the household buys")
-    qty = h[h.Choice != "No Purchase"].groupby("Choice").Quantity.agg(["count","mean"]).reindex(["Regular","Premium"]).dropna()
-    st.dataframe(qty.rename(columns={"count":"Observed weeks","mean":"Average capsules/week"}), use_container_width=True)
+    quantity = h[h["Choice"] != "No Purchase"].groupby("Choice")["Quantity"].agg(["count", "mean"]).reindex(["Regular", "Premium"]).dropna()
+    st.dataframe(quantity.rename(columns={"count": "Observed weeks", "mean": "Average capsules/week"}), use_container_width=True)
 
 with t2:
-    st.markdown("#### Model performance on the observed sample")
-    purchase_acc = accuracy_score(PURCHASE_Y, PURCHASE_MODEL.predict(features(OBS)))
-    choice_acc = accuracy_score(CHOICE_Y, CHOICE_MODEL.predict(features(BUYERS)))
-    a,b = st.columns(2)
-    a.metric("Purchase classifier", f"{purchase_acc:.0%} training accuracy")
-    b.metric("Regular/Premium classifier", f"{choice_acc:.0%} training accuracy")
-    st.caption("These are in-sample figures. With only 33 household-week observations, they are descriptive rather than evidence of out-of-sample predictive performance.")
-    st.markdown("#### Observations")
-    st.dataframe(household_frame(hh)[["T","P_Regular","P_Premium","Regular","Premium","Choice","Quantity"]], use_container_width=True, hide_index=True)
+    purchase_accuracy = accuracy_score(purchase_y, purchase_model.predict(features(OBS)))
+    choice_accuracy = accuracy_score(choice_y, choice_model.predict(features(BUYERS)))
+    a, b = st.columns(2)
+    a.metric("Purchase classifier", f"{purchase_accuracy:.0%} training accuracy")
+    b.metric("Regular/Premium classifier", f"{choice_accuracy:.0%} training accuracy")
+    st.caption("These are in-sample figures. With only 33 household-week observations, they should be treated as descriptive rather than proof of out-of-sample predictive performance.")
+
+    st.markdown("#### Household observations")
+    st.dataframe(
+        h[["T", "P_Regular", "P_Premium", "Regular", "Premium", "Choice", "Quantity"]],
+        use_container_width=True,
+        hide_index=True,
+    )
 
 with t3:
-    st.markdown("#### Why Household 3 now has a no-purchase region")
-    st.write("Previously, the app fitted a Regular-vs-Premium classifier separately inside each household. That approach could not create a no-purchase zone for Household 3 because it did not model purchase versus non-purchase as a separate decision. It also could not estimate a Regular-vs-Premium boundary for Household 3 because Regular is never observed there.")
-    st.write("The revised model separates those questions. The first classifier estimates whether the household buys at all. The second classifier asks which capsule type is chosen, conditional on buying. The resulting decision map can therefore display all three behavioral outcomes while remaining honest about where the evidence comes from.")
+    st.markdown("#### Why the old graph could not show No Purchase for Household 3")
+    st.write("The previous implementation fitted a separate Regular-vs-Premium model for each household. Household 3 has no Regular observations, and that model did not contain a separate purchase decision. As a result, there was no defensible mechanism for drawing a No Purchase zone.")
+    st.markdown("#### What changed")
+    st.write("The revised model separates purchase incidence from product choice. The purchase classifier is estimated on all household-week observations, while the Regular/Premium classifier is estimated only among weeks in which a purchase occurred. Household indicators shift the pooled decision functions for Household 2 and Household 3.")
     st.markdown("#### What this model is — and is not")
-    st.write("It is an interpretable exploratory demand-classification model. It is not a structural utility model, a causal price-elasticity estimate, or a validated willingness-to-pay model. More weeks and more households would be needed before making stronger economic claims.")
-    st.markdown("#### Next empirical step")
-    st.write("With a larger experiment, the natural extension would be to estimate a conditional/multinomial choice model with household heterogeneity, then add quantity demand and out-of-sample validation. The current app is deliberately simpler so the proposed classification logic is visible rather than buried.")
+    st.write("This is an interpretable exploratory demand-classification model. It is not a structural utility model, a causal elasticity estimate, or a validated willingness-to-pay model. The small sample is the main limitation, and stronger economic conclusions would require a larger experiment.")
+    st.markdown("#### Natural next step")
+    st.write("With more weeks and households, the same logic could be extended into a conditional choice model with richer household heterogeneity, out-of-sample validation, price elasticities and a separate quantity-demand component.")
 
 st.divider()
-st.caption("Coffee Capsule Demand Lab · Exploratory model based on the supplied 11-week experiment · 33 household-week observations")
+st.caption("Coffee Capsule Demand Lab · Exploratory analysis of the supplied 11-week experiment · 33 household-week observations")
