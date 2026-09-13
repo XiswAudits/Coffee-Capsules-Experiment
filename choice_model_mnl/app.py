@@ -4,7 +4,7 @@ import plotly.graph_objects as go
 import streamlit as st
 from scipy.optimize import minimize
 
-st.set_page_config(page_title="Coffee Capsule Choice Model",page_icon="☕",layout="wide",initial_sidebar_state="expanded")
+st.set_page_config(page_title="Coffee Capsule Choice Model", page_icon="☕", layout="wide", initial_sidebar_state="expanded")
 RAW=pd.read_csv("coffee_capsules_data.csv")
 HOUSEHOLDS={"Household 1":("HH1_Regular","HH1_Premium"),"Household 2":("HH2_Regular","HH2_Premium"),"Household 3":("HH3_Regular","HH3_Premium")}
 CHOICES=["Regular","Premium","No Purchase"]
@@ -65,26 +65,34 @@ def qstats(s):
     r=s.loc[s.Choice=="Regular","Regular"]; p=s.loc[s.Choice=="Premium","Premium"]; return float(s.Quantity.mean()),float(r.mean()) if len(r) else 0.,float(p.mean()) if len(p) else 0.
 
 st.markdown("""<style>
-.block-container{max-width:1400px;padding:1.2rem 2rem 3rem;background:#f6f7f5}[data-testid="stAppViewContainer"]{background:#f6f7f5}section[data-testid="stSidebar"]{background:#fbfcfa;border-right:1px solid #e5e7eb}.brand{font-size:1.12rem;font-weight:750;color:#16352a;padding:8px 0 22px}.navlabel{font-size:.68rem;text-transform:uppercase;letter-spacing:.12em;color:#98a2b3;margin:18px 0 8px}.navitem{padding:9px 11px;border-radius:10px;color:#475467;font-size:.9rem}.active{background:#e5f4ec;color:#176b48;font-weight:700}.topbar{display:flex;justify-content:space-between;align-items:center;background:white;border:1px solid #e5e7eb;border-radius:18px;padding:11px 16px;margin-bottom:18px}.search{background:#f6f7f8;border-radius:11px;padding:9px 14px;color:#98a2b3;font-size:.85rem;width:45%}.eyebrow{font-size:.7rem;letter-spacing:.12em;text-transform:uppercase;color:#667085;font-weight:700}.subtitle{color:#667085;font-size:.92rem}.card{background:#fff;border:1px solid #e5e7eb;border-radius:18px;padding:18px 20px;height:100%;box-shadow:0 2px 8px rgba(16,24,40,.025)}.card-title{font-weight:700;color:#172033;font-size:.96rem;margin-bottom:8px}.mini{color:#667085;font-size:.78rem}.insight{background:#163f30;color:white;border-radius:18px;padding:20px;height:100%}.insight .mini{color:#c8ddd4}.insight h3{margin:5px 0 8px;color:white}.eq{background:#f8fafc;border:1px solid #e5e7eb;border-radius:12px;padding:12px 15px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;color:#172033;margin:8px 0}[data-testid="stMetric"]{background:white;border:1px solid #e5e7eb;border-radius:15px;padding:13px 15px}div[data-testid="stExpander"]{border:1px solid #e5e7eb;border-radius:14px;background:white}
+.block-container{max-width:1400px;padding:1.2rem 2rem 3rem;background:#f6f7f5}[data-testid="stAppViewContainer"]{background:#f6f7f5}section[data-testid="stSidebar"]{background:#fbfcfa;border-right:1px solid #e5e7eb}.brand{font-size:1.12rem;font-weight:750;color:#16352a;padding:8px 0 22px}.navlabel{font-size:.68rem;text-transform:uppercase;letter-spacing:.12em;color:#98a2b3;margin:18px 0 8px}.navitem{display:block;padding:9px 11px;border-radius:10px;color:#475467;font-size:.9rem;text-decoration:none;margin:2px 0}.navitem:hover{background:#eef4f0;color:#176b48}.active{background:#e5f4ec;color:#176b48;font-weight:700}.topbar{display:flex;justify-content:space-between;align-items:center;background:white;border:1px solid #e5e7eb;border-radius:18px;padding:11px 16px;margin-bottom:18px}.search{background:#f6f7f8;border-radius:11px;padding:9px 14px;color:#98a2b3;font-size:.85rem;width:45%}.eyebrow{font-size:.7rem;letter-spacing:.12em;text-transform:uppercase;color:#667085;font-weight:700}.subtitle{color:#667085;font-size:.92rem}.card{background:#fff;border:1px solid #e5e7eb;border-radius:18px;padding:18px 20px;height:100%;box-shadow:0 2px 8px rgba(16,24,40,.025)}.card-title{font-weight:700;color:#172033;font-size:.96rem;margin-bottom:8px}.mini{color:#667085;font-size:.78rem}.insight{background:#163f30;color:white;border-radius:18px;padding:20px;height:100%}.insight .mini{color:#c8ddd4}.insight h3{margin:5px 0 8px;color:white}.eq{background:#f8fafc;border:1px solid #e5e7eb;border-radius:12px;padding:12px 15px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;color:#172033;margin:8px 0}[data-testid="stMetric"]{background:white;border:1px solid #e5e7eb;border-radius:15px;padding:13px 15px}div[data-testid="stExpander"]{border:1px solid #e5e7eb;border-radius:14px;background:white}
 </style>""",unsafe_allow_html=True)
+
 with st.sidebar:
     st.markdown('<div class="brand">☕ Choice Model Lab</div>',unsafe_allow_html=True)
-    st.markdown('<div class="navlabel">Workspace</div><div class="navitem active">▦ Dashboard</div><div class="navitem">◌ Experiment</div><div class="navitem">⌁ Model</div><div class="navitem">◫ Observations</div><div class="navlabel">Explore</div><div class="navitem">◉ Methodology</div>',unsafe_allow_html=True)
+    st.markdown('<div class="navlabel">Workspace</div><a class="navitem active" href="#dashboard">▦ Dashboard</a><a class="navitem" href="#experiment">◌ Experiment</a><a class="navitem" href="#model">⌁ Model</a><a class="navitem" href="#observations">◫ Observations</a><div class="navlabel">Explore</div><a class="navitem" href="#methodology">◉ Methodology</a>',unsafe_allow_html=True)
     st.divider(); household=st.selectbox("Household",list(HOUSEHOLDS)); st.markdown('<div class="navlabel">Scenario</div>',unsafe_allow_html=True); pr=st.slider("Regular price",30,70,42); pp=st.slider("Premium price",65,105,93); st.caption("33 observations · 11 weeks · 3 independent MNLs")
 fig,sc,pred=chart(household,pr,pp); m=MODELS[household]; avg,qr,qp=qstats(m["sample"]); rn,pn,sl,it=boundaries(m); ar,ap,br,bp=m["params"]
+
+st.markdown('<div id="dashboard"></div>',unsafe_allow_html=True)
 st.markdown('<div class="topbar"><div class="search">⌕ &nbsp; Explore the experiment</div><div class="mini">Independent household choice research</div></div>',unsafe_allow_html=True)
 st.markdown('<div class="eyebrow">Discrete choice demand experiment</div>',unsafe_allow_html=True); st.title("Household choice dashboard"); st.markdown('<div class="subtitle">An independent multinomial logit model for each household. Explore how price changes the probability of choosing Regular, Premium, or No Purchase.</div>',unsafe_allow_html=True); st.write("")
 a,b,c,d=st.columns(4); a.metric("Most likely choice",pred); b.metric("P(Regular)",f"{sc['Regular']:.0%}"); c.metric("P(Premium)",f"{sc['Premium']:.0%}"); d.metric("P(No Purchase)",f"{sc['No Purchase']:.0%}")
+
+st.markdown('<div id="experiment"></div>',unsafe_allow_html=True)
 left,right=st.columns([1.65,.8])
 with left:
     st.markdown('<div class="card"><div class="card-title">Decision map</div><div class="mini">Observed choices, equal-utility boundaries and the current scenario.</div></div>',unsafe_allow_html=True); st.plotly_chart(fig,use_container_width=True)
 with right:
     st.markdown(f'<div class="insight"><div class="eyebrow" style="color:#9bc9b5">Scenario result</div><h3>{pred}</h3><div class="mini">Regular = {pr} · Premium = {pp}</div><hr style="border-color:#3b6254"><b>Estimated probabilities</b><br><br>Regular &nbsp; <b>{sc["Regular"]:.1%}</b><br>Premium &nbsp; <b>{sc["Premium"]:.1%}</b><br>No Purchase &nbsp; <b>{sc["No Purchase"]:.1%}</b></div>',unsafe_allow_html=True); st.write(""); st.markdown(f'<div class="card"><div class="card-title">Demand snapshot</div><div class="mini">Observed average across all 11 weeks</div><h2>{avg:.2f}</h2><div class="mini">capsules / week</div><br>Regular when purchased: <b>{qr:.2f}</b><br>Premium when purchased: <b>{qp:.2f}</b></div>',unsafe_allow_html=True)
-st.write(""); x,y,z=st.columns(3)
+
+st.markdown('<div id="model"></div>',unsafe_allow_html=True)
+x,y,z=st.columns(3)
 with x: st.markdown('<div class="card"><div class="card-title">Utility</div><div class="mini">Each household has its own fitted utility.</div><div class="eq">V_R = ASC_R + β_R · z_R</div><div class="eq">V_P = ASC_P + β_P · z_P</div><div class="eq">V_N = 0</div></div>',unsafe_allow_html=True)
 with y: st.markdown(f'<div class="card"><div class="card-title">Selected household</div><div class="mini">{household}</div><h3>{ar:.2f} / {ap:.2f}</h3><div class="mini">ASCs: Regular / Premium</div><h3>{br:.2f} / {bp:.2f}</h3><div class="mini">Price coefficients: Regular / Premium</div></div>',unsafe_allow_html=True)
 with z: st.markdown(f'<div class="card"><div class="card-title">Choice boundaries</div><div class="mini">Equal-utility thresholds in original price units.</div><br>Regular = Premium<br><b>P_P = {sl:.2f} × P_R + {it:.1f}</b><br><br>Regular = No Purchase<br><b>P_R ≈ {rn:.1f}</b><br><br>Premium = No Purchase<br><b>P_P ≈ {pn:.1f}</b></div>',unsafe_allow_html=True)
 
+st.markdown('<div id="methodology"></div>',unsafe_allow_html=True)
 st.subheader("Understand the model")
 with st.expander("Where do the numbers come from?"):
     st.markdown(f"""The model is estimated **separately for {household}** using that household's 11 observed weekly choices.
@@ -112,6 +120,8 @@ with st.expander("How should I read the decision map?"):
 - **Star** is the scenario being tested.
 
 The MNL produces probabilities, so these boundaries should not be interpreted as hard causal willingness-to-pay thresholds.""")
+
+st.markdown('<div id="observations"></div>',unsafe_allow_html=True)
 st.subheader("Observed weeks"); d=m["sample"][["T","P_Regular","P_Premium","Choice","Quantity"]].copy(); d.columns=["Week","Regular price","Premium price","Observed choice","Quantity"]; st.dataframe(d,use_container_width=True,hide_index=True)
 if any(m["at_bound"].values()):
     hit=[k for k,v in m["at_bound"].items() if v]; st.warning("Numerical diagnostic: "+", ".join(hit)+" reached the ±20 optimisation bound. Treat that estimate as weakly identified rather than as a precise economic effect.")
