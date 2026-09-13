@@ -109,8 +109,6 @@ def decision_map(household, scenario_regular, scenario_premium):
     p_slope, p_intercept = boundary(purchase_model, household)
     c_slope, c_intercept = boundary(choice_model, household)
 
-    # Keep the experimental price area visible, but expand the vertical range
-    # enough to show a boundary when it sits just outside the default window.
     x_min, x_max = 30, 70
     candidates = [65, 105]
     for slope, intercept in [(p_slope, p_intercept), (c_slope, c_intercept)]:
@@ -214,7 +212,29 @@ div[data-testid="stExpander"] {border:1px solid #E7E9EE;border-radius:14px;}
 # Sidebar controls
 # -----------------------------------------------------------------------------
 with st.sidebar:
-    st.markdown("### ☕ Coffee Capsule Lab")
+    title_col, info_col = st.columns([0.84, 0.16], vertical_alignment="center")
+    with title_col:
+        st.markdown("### ☕ Coffee Capsule Lab")
+    with info_col:
+        with st.popover("ⓘ"):
+            st.markdown("### Model at a glance")
+            st.caption("A short guide to what is being measured, how the lines are constructed, and how to interpret the results.")
+
+            st.markdown("**Model — two-stage logistic classification**")
+            st.markdown("Two pooled **binary logistic regression** classifiers are used rather than one forced three-class model.")
+            st.markdown("- **Stage 1:** Buy vs. No Purchase\n- **Stage 2:** Regular vs. Premium, given Buy")
+
+            st.markdown("**What it measures — choice probabilities**")
+            st.markdown("The inputs are **P_R**, **P_P**, and household identity. The output is a probability for each of the three observed outcomes.")
+            st.markdown("- P(No Purchase)\n- P(Regular)\n- P(Premium)")
+
+            st.markdown("**The boundaries — 50% probability contours**")
+            st.markdown("Each line is where its binary classifier reaches **50%**. Because the model is linear in price, the contour is a straight line.")
+            st.markdown("- **Dashed:** Buy ↔ No Purchase\n- **Solid:** Regular ↔ Premium | Buy")
+
+            st.markdown("**Important caveat — useful, but exploratory**")
+            st.markdown("The sample is only **33 household-weeks**. The model is interpretable and useful for the experiment, but it is not a structural utility, causal elasticity, or validated WTP model.")
+
     st.caption("A simple way to explore the experiment's price-choice model.")
     household = st.selectbox("Household", list(HOUSEHOLDS))
     st.divider()
@@ -244,45 +264,6 @@ m1.metric("Most likely choice", prediction)
 m2.metric("P(Regular)", f"{scenario['Regular']:.0%}")
 m3.metric("P(Premium)", f"{scenario['Premium']:.0%}")
 m4.metric("P(No purchase)", f"{scenario['No Purchase']:.0%}")
-
-# -----------------------------------------------------------------------------
-# Model summary — intentionally concise and readable
-# -----------------------------------------------------------------------------
-st.markdown("### Model at a glance")
-st.markdown('<div class="section-intro">A short guide to what is being measured, how the lines are constructed, and how to interpret the results.</div>', unsafe_allow_html=True)
-
-c1, c2, c3, c4 = st.columns(4)
-with c1:
-    st.markdown("""
-    <div class="info-card">
-      <div class="label">Model</div><h4>Two-stage logistic classification</h4>
-      <p>Two pooled <b>binary logistic regression</b> classifiers are used rather than one forced three-class model.</p>
-      <ul><li>Stage 1: Buy vs. No Purchase</li><li>Stage 2: Regular vs. Premium, given Buy</li></ul>
-    </div>
-    """, unsafe_allow_html=True)
-with c2:
-    st.markdown("""
-    <div class="info-card">
-      <div class="label">What it measures</div><h4>Choice probabilities</h4>
-      <p>The inputs are <b>P_R</b>, <b>P_P</b>, and household identity. The output is a probability for each of the three observed outcomes.</p>
-      <ul><li>P(No Purchase)</li><li>P(Regular)</li><li>P(Premium)</li></ul>
-    </div>
-    """, unsafe_allow_html=True)
-with c3:
-    st.markdown("""
-    <div class="info-card">
-      <div class="label">The boundaries</div><h4>50% probability contours</h4>
-      <p>Each line is where its binary classifier reaches <b>50%</b>. Because the model is linear in price, the contour is a straight line.</p>
-      <ul><li>Dashed: Buy ↔ No Purchase</li><li>Solid: Regular ↔ Premium | Buy</li></ul>
-    </div>
-    """, unsafe_allow_html=True)
-with c4:
-    st.markdown("""
-    <div class="info-card">
-      <div class="label">Important caveat</div><h4>Useful, but exploratory</h4>
-      <p>The sample is only <b>33 household-weeks</b>. The model is interpretable and useful for the experiment, but it is not a structural utility, causal elasticity, or validated WTP model.</p>
-    </div>
-    """, unsafe_allow_html=True)
 
 # -----------------------------------------------------------------------------
 # Decision map
@@ -390,5 +371,17 @@ with t3:
     st.markdown("#### Natural next step")
     st.write("With more households and weeks, the model could be extended toward a richer discrete-choice specification with household heterogeneity, out-of-sample validation, and a separate quantity-demand component.")
 
+# -----------------------------------------------------------------------------
+# Footer model explainer
+# -----------------------------------------------------------------------------
 st.divider()
-st.caption("Coffee Capsule Demand Lab · 33 household-week observations · two-stage logistic classification · exploratory analysis")
+footer_left, footer_right = st.columns([0.72, 0.28], vertical_alignment="center")
+with footer_left:
+    st.caption("Coffee Capsule Demand Lab · 33 household-week observations · two-stage logistic classification · exploratory analysis")
+with footer_right:
+    with st.popover("ⓘ More info"):
+        st.markdown("### Why is this a classification model?")
+        st.markdown("The model is a **classification algorithm** because the outcome being predicted is categorical: **No Purchase, Regular, or Premium**. It is not trying to predict a continuous quantity directly.")
+        st.markdown("The two logistic regressions turn the price inputs (**P_R**, **P_P**) and household identity into class probabilities. A binary logistic classifier estimates the probability of one class and uses a threshold — here, **50%** — to define the predicted class.")
+        st.markdown("That is also why the decision map has straight boundaries: with a linear logistic model, the 50% contour corresponds to a linear decision boundary in price space. Scikit-learn explicitly describes `LogisticRegression` as a classifier and provides `predict_proba()` for class probabilities.")
+        st.markdown("**In short:** the model answers *which outcome is more likely at these prices?* It does **not** directly estimate a structural utility function, causal price elasticity, or validated willingness-to-pay.")
