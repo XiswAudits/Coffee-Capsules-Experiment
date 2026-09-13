@@ -1,37 +1,50 @@
-# Coffee Capsule Demand Classifier
+# Coffee Capsule Demand & Choice Models
 
-Interactive Streamlit website for the supplied coffee-capsule household dataset.
+Interactive Streamlit applications built from the 11-week coffee-capsule household experiment.
 
-## Run locally
+## Applications
+
+### 1. Original demand classifier
+
+The original app is the root `app.py`. It uses a two-stage pooled logistic classification approach to visualise Buy/No Purchase and Regular/Premium boundaries.
+
+Run locally:
 
 ```bash
 pip install -r requirements.txt
 streamlit run app.py
 ```
 
-Then open the local URL shown by Streamlit.
+### 2. Independent household choice model — MNL
 
-## Deploy
+The new discrete-choice application is `choice_model_mnl/app.py`.
 
-The app is deployment-ready for Streamlit Community Cloud. Put `app.py`, `requirements.txt`,
-and optionally `coffee_capsules_data.csv` in a GitHub repository, then create a Streamlit app
-pointing to `app.py`.
+It estimates **one independent multinomial logit model for each household**, with three competing alternatives:
 
-## Important modeling note
+- Regular
+- Premium
+- No Purchase
 
-The supplied dataset has only 11 observations per household:
+It keeps zero-purchase weeks as genuine demand observations, estimates joint choice probabilities, shows pairwise utility boundaries, and adds a zero-inclusive expected-demand layer.
 
-- Household 1: Regular + Premium, but no No Purchase observations.
-- Household 2: Regular + Premium, but no No Purchase observations.
-- Household 3: Premium + No Purchase, but no Regular observations.
+For the full methodology, equations, assumptions, identification warnings, and deployment instructions, see [`choice_model_mnl/README.md`](choice_model_mnl/README.md).
 
-Therefore, a separate three-class linear classifier cannot be honestly fitted for every household.
-The app handles this explicitly rather than inventing an unsupported third zone.
+## Dataset
 
-For Household 1 and Household 2 it fits a binary Regular-vs-Premium logistic classifier and displays
-the implied linear boundary `P_P = m * P_R + b`.
+The shared `coffee_capsules_data.csv` contains 11 weekly observations for each of three households, including Regular/Premium prices and household quantities. Zero quantities are retained because they represent observed No Purchase behaviour.
 
-For Household 3 it shows the observed Premium/No-Purchase pattern and explains why a
-Regular-vs-Premium boundary is not identifiable from the data.
+## Streamlit deployment
 
-The quantity estimate is the historical average quantity for the predicted choice.
+For the MNL application, create a Streamlit Community Cloud app using:
+
+```text
+choice_model_mnl/app.py
+```
+
+The application reads the shared dataset from the repository and uses the root `requirements.txt`, which includes SciPy for maximum-likelihood numerical optimisation.
+
+## Important limitation
+
+The independent MNL design is intentionally household-specific, but each household has only 11 observations. Household 1 and Household 2 never observed No Purchase, while Household 3 never observed Regular. An unconstrained MNL can therefore experience separation and produce unstable or divergent estimates. The implementation uses finite optimisation bounds and explicitly flags parameters that reach a bound.
+
+The resulting model should be treated as an exploratory choice-modelling tool, not as validated causal elasticity, willingness-to-pay, or out-of-sample forecasting evidence.
