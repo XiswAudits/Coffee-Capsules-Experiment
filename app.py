@@ -92,16 +92,80 @@ with i2: st.markdown('<div class="card"><div class="card-title">Choice stage</di
 with i3: st.markdown(f'<div class="card"><div class="card-title">Current household</div><div class="card-sub">{household} · 11 weekly observations</div><div class="kpi-value">{max(scenario["Regular"],scenario["Premium"],scenario["No Purchase"]):.0%}</div><div class="card-sub">highest predicted choice probability</div></div>',unsafe_allow_html=True)
 
 st.markdown('<div id="methodology"></div>',unsafe_allow_html=True);st.subheader("Model & methodology")
-with st.expander("How the two-stage model works"): st.markdown(f"""**Stage 1 — Purchase.** A pooled logistic regression estimates the probability that the household purchases anything.
+with st.expander("Step-by-step explanation"):
+    st.markdown(f"""### 1. Start with the original data
+- 11 weeks × 3 households = **33 household-week observations**.
+- Each observation contains Regular price, Premium price, Regular quantity, and Premium quantity.
 
-**Stage 2 — Product choice.** For observations where a purchase is observed, a second logistic regression estimates the probability of Premium rather than Regular.
+### 2. Convert quantities into observed choices
+- Regular quantity > 0 → **Regular**
+- Otherwise Premium quantity > 0 → **Premium**
+- Otherwise → **No Purchase**
 
-The final probabilities are:
-- **P(No Purchase) = 1 − P(Buy)**
-- **P(Regular) = P(Buy) × [1 − P(Premium | Buy)]**
-- **P(Premium) = P(Buy) × P(Premium | Buy)**
+### 3. Split the decision into two stages
+**Stage 1 — Do I buy?** Buy = 1 for Regular/Premium and 0 for No Purchase.
 
-For the current scenario, the model predicts **{scenario['Regular']:.1%} Regular, {scenario['Premium']:.1%} Premium, and {scenario['No Purchase']:.1%} No Purchase**.""")
+**Stage 2 — What do I buy, given that I buy?** Premium = 1 for Premium and 0 for Regular.
+
+So the logic is: **Do I buy? → What do I buy?**
+
+### 4. Standardize prices
+`Z_R = (P_R − mean(P_R)) / SD(P_R)`  
+`Z_P = (P_P − mean(P_P)) / SD(P_P)`
+
+Across the 33 observations: Regular mean ≈ **€46.09**, SD ≈ **€8.48**; Premium mean ≈ **€81.73**, SD ≈ **€9.81**.
+
+Example: €40 Regular → Z_R ≈ −0.718; €70 Premium → Z_P ≈ −1.196.
+
+### 5. Add household indicators
+Household 1 is the reference household. Household 2 and Household 3 enter as dummy variables, alongside the two standardized prices.
+
+### 6. Estimate Stage 1 — P(Buy)
+The logistic model is:
+
+`logit(P(Buy)) = β₀ + β_R Z_R + β_P Z_P + β_HH2 HH2 + β_HH3 HH3`
+
+Approximate fitted coefficients: β₀ = **3.003**, β_R = **0.177**, β_P = **−1.197**, β_HH2 = **0.555**, β_HH3 = **−1.448**.
+
+For Household 1, Week 1: `Z ≈ 4.31`, so `P(Buy) ≈ 98.7%`.
+
+### 7. Estimate Stage 2 — P(Premium | Buy)
+The four No Purchase observations are excluded, leaving **29 buyer observations**: HH1 = 11, HH2 = 11, HH3 = 7.
+
+The second logistic model is:
+
+`logit(P(Premium | Buy)) = γ₀ + γ_R Z_R + γ_P Z_P + γ_HH2 HH2 + γ_HH3 HH3`
+
+Approximate fitted coefficients: γ₀ = **−1.096**, γ_R = **0.520**, γ_P = **−1.514**, γ_HH2 = **0.125**, γ_HH3 = **1.542**.
+
+For Household 1, Week 4: Z_R ≈ 2.23 and Z_P ≈ −0.69, giving `P(Premium | Buy) ≈ 75%`.
+
+### 8. Combine the two stages
+`P(No Purchase) = 1 − P(Buy)`  
+`P(Premium) = P(Buy) × P(Premium | Buy)`  
+`P(Regular) = P(Buy) × [1 − P(Premium | Buy)]`
+
+Example: if P(Buy) = 80% and P(Premium | Buy) = 60%, then No Purchase = 20%, Premium = 48%, Regular = 32%.
+
+### 9. Derive the 50% prediction boundaries
+For logistic regression, a 50% probability occurs when the linear predictor equals zero.
+
+For Household 1, the Purchase boundary becomes approximately:
+
+`P_P = 0.17 × P_R + 98.4`
+
+The Regular/Premium conditional boundary becomes approximately:
+
+`P_P = 0.40 × P_R + 56.3`
+
+These coefficients are algebraic transformations of the estimated regression coefficients and the price mean/SD; they are not separately estimated parameters.
+
+### 10. Create the decision map
+For many Regular/Premium price combinations, the model calculates P(Regular), P(Premium), and P(No Purchase). The highest-probability choice defines the predicted region shown on the map.
+
+**Key flow:** Raw data → observed choices → standardize prices → two logistic regressions → estimated coefficients → probabilities → combine stages → 50% boundaries → decision map.
+
+**Important:** This is an exploratory classification model, not a structural/causal demand model. The dashed boundaries are 50% prediction contours, not validated willingness-to-pay curves.""")
 with st.expander("How should I read the boundaries?"):
     ps,pi=purchase_boundary;cs,ci=choice_boundary
     st.markdown(f"""The dashed lines are **50% prediction contours**. They are not literal willingness-to-pay curves.
