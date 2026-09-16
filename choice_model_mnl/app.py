@@ -52,12 +52,17 @@ def quantity_stats(frame):
     regular=frame.loc[frame.Choice=="Regular","Regular"];premium=frame.loc[frame.Choice=="Premium","Premium"]
     return float(frame.Quantity.mean()),float(regular.mean()) if len(regular) else 0.,float(premium.mean()) if len(premium) else 0.
 
-def expected_revenue(model,regular_price,premium_price):
+def expected_revenue_household(model,regular_price,premium_price):
     scenario=probabilities(model,regular_price,premium_price)
     _,regular_qty,premium_qty=quantity_stats(model["sample"])
     regular_revenue=scenario["Regular"]*regular_price*regular_qty
     premium_revenue=scenario["Premium"]*premium_price*premium_qty
     return {"Regular":regular_revenue,"Premium":premium_revenue,"Total":regular_revenue+premium_revenue,"Regular_Qty":regular_qty,"Premium_Qty":premium_qty}
+
+def expected_revenue_all(regular_price,premium_price):
+    household_revenue={h:expected_revenue_household(model,regular_price,premium_price) for h,model in MODELS.items()}
+    total=sum(r["Total"] for r in household_revenue.values())
+    return household_revenue,total
 
 def decision_map(household,regular_price,premium_price):
     model=MODELS[household];sample=model["sample"];xs=np.linspace(30,70,180);ys=np.linspace(55,145,180);xx,yy=np.meshgrid(xs,ys);probs=softmax(utility(model["params"],xx.ravel(),yy.ravel()));region=probs.argmax(axis=1).reshape(xx.shape)
@@ -95,19 +100,26 @@ with sc1: household=st.selectbox("Household",list(HOUSEHOLDS),key="mnl_household
 with sc2: regular_price=st.slider("Regular price (€)",30,70,BASELINE_R,key="mnl_regular_price")
 with sc3: premium_price=st.slider("Premium price (€)",65,105,BASELINE_P,key="mnl_premium_price")
 
-fig,scenario,predicted=decision_map(household,regular_price,premium_price);model=MODELS[household];avg_qty,regular_qty,premium_qty=quantity_stats(model["sample"]);revenue=expected_revenue(model,regular_price,premium_price);rn,pn,slope,intercept=boundaries(model);asc_r,asc_p,beta_r,beta_p=model["params"];hits=[n for n,v in model["at_bound"].items() if v];counts=model["observed_counts"]
+fig,scenario,predicted=decision_map(household,regular_price,premium_price);model=MODELS[household];avg_qty,regular_qty,premium_qty=quantity_stats(model["sample"]);revenue=expected_revenue_household(model,regular_price,premium_price);household_revenues,total_expected_revenue=expected_revenue_all(regular_price,premium_price);rn,pn,slope,intercept=boundaries(model);asc_r,asc_p,beta_r,beta_p=model["params"];hits=[n for n,v in model["at_bound"].items() if v];counts=model["observed_counts"]
 st.markdown(f'<div class="hero"><div class="hero-copy"><div class="eyebrow">Multinomial logit model</div><h1>Household Choice<br>Model</h1><p>Estimate choice probabilities, expected revenue, and equal-utility boundaries for Regular, Premium, and No Purchase using an independent MNL for each household.</p></div></div>',unsafe_allow_html=True)
 m1,m2,m3,m4=st.columns(4);m1.metric("Most likely choice",predicted);m2.metric("P(Regular)",f"{scenario['Regular']:.0%}");m3.metric("P(Premium)",f"{scenario['Premium']:.0%}");m4.metric("P(No Purchase)",f"{scenario['No Purchase']:.0%}")
 st.markdown('<div id="model"></div>',unsafe_allow_html=True);left,right=st.columns([1.65,.8],gap="medium")
 with left: st.markdown('<div class="card"><div class="card-title">Choice map</div><div class="card-sub">Observed choices, model-implied utility boundaries, and the current price scenario.</div></div>',unsafe_allow_html=True);st.plotly_chart(fig,use_container_width=True,config={"displayModeBar":False,"responsive":True})
-with right: st.markdown(f'<div class="insight"><div class="eyebrow">Scenario result</div><h2>{predicted}</h2><p>At Regular €{regular_price} and Premium €{premium_price}</p><div style="height:12px"></div><div class="prob-row"><span>Regular</span><b>{scenario["Regular"]:.1%}</b></div><div class="prob-row"><span>Premium</span><b>{scenario["Premium"]:.1%}</b></div><div class="prob-row"><span>No Purchase</span><b>{scenario["No Purchase"]:.1%}</b></div></div>',unsafe_allow_html=True);st.write("");st.markdown(f'<div class="card"><div class="card-title">Expected revenue</div><div class="card-sub">Scenario revenue for {household}, using the MNL choice probabilities and observed conditional average quantities.</div><div class="kpi-value">€{revenue["Total"]:.2f}</div><div class="card-sub">total expected revenue</div><div style="height:8px"></div><span class="pill">Regular €{revenue["Regular"]:.2f}</span><span class="pill">Premium €{revenue["Premium"]:.2f}</span></div>',unsafe_allow_html=True)
+with right: st.markdown(f'<div class="insight"><div class="eyebrow">Scenario result</div><h2>{predicted}</h2><p>At Regular €{regular_price} and Premium €{premium_price}</p><div style="height:12px"></div><div class="prob-row"><span>Regular</span><b>{scenario["Regular"]:.1%}</b></div><div class="prob-row"><span>Premium</span><b>{scenario["Premium"]:.1%}</b></div><div class="prob-row"><span>No Purchase</span><b>{scenario["No Purchase"]:.1%}</b></div></div>',unsafe_allow_html=True);st.write("");st.markdown(f'<div class="card"><div class="card-title">Expected revenue</div><div class="card-sub">{household} expected revenue at the selected price scenario.</div><div class="kpi-value">€{revenue["Total"]:.2f}</div><div class="card-sub">selected household</div><div style="height:8px"></div><span class="pill">Regular €{revenue["Regular"]:.2f}</span><span class="pill">Premium €{revenue["Premium"]:.2f}</span><div class="card-sub" style="margin-top:9px;">Across all 3 households: <b>€{total_expected_revenue:.2f}</b></div></div>',unsafe_allow_html=True)
 
 st.markdown('<div id="insights"></div>',unsafe_allow_html=True);i1,i2,i3=st.columns(3)
 with i1: st.markdown('<div class="card"><div class="card-title">Utility specification</div><div class="card-sub">No Purchase is the reference alternative.</div><div class="equation">Vᵣ = ASCᵣ + βᵣ · zᵣ</div><div class="equation">Vₚ = ASCₚ + βₚ · zₚ</div><div class="equation">Vₙ = 0</div></div>',unsafe_allow_html=True)
 with i2: st.markdown(f'<div class="card"><div class="card-title">Selected household parameters</div><div class="card-sub">{household}</div><div class="kpi-value">{asc_r:.2f} / {asc_p:.2f}</div><div class="card-sub">ASC Regular / Premium</div><div class="kpi-value">{beta_r:.2f} / {beta_p:.2f}</div><div class="card-sub">Price coefficient Regular / Premium</div></div>',unsafe_allow_html=True)
 with i3: st.markdown(f'<div class="card"><div class="card-title">Choice boundaries</div><div class="card-sub">Equal-utility thresholds in original price units.</div><div class="equation">Regular = Premium<br>Pₚ = {slope:.2f} × Pᵣ + {intercept:.1f}</div><div class="card-sub" style="margin-top:9px;">Regular = No Purchase: {rn:.1f} €</div><div class="card-sub">Premium = No Purchase: {pn:.1f} €</div></div>',unsafe_allow_html=True)
 
-st.markdown('<div class="card" style="margin-top:16px;"><div class="card-title">Expected revenue equation</div><div class="card-sub">At the selected price scenario, expected revenue combines the probability of each paid choice with its price and observed conditional average quantity.</div><div class="equation">E[Revenue] = P(Regular) × Pᵣ × E[Q | Regular] + P(Premium) × Pₚ × E[Q | Premium]</div><div class="card-sub" style="margin-top:9px;">No Purchase contributes €0. This quantity layer uses observed conditional averages, so it is illustrative rather than a structural quantity-demand model.</div></div>',unsafe_allow_html=True)
+st.markdown('<div class="card" style="margin-top:16px;"><div class="card-title">Expected revenue equation</div><div class="card-sub">First calculate expected revenue for each household at the selected prices, then sum across households.</div><div class="equation">E[Revenueₕ] = Pₕ(Regular) × Pᵣ × E[Qₕ | Regular] + Pₕ(Premium) × Pₚ × E[Qₕ | Premium]</div><div class="equation">E[Revenueₜₒₜₐₗ] = Σₕ E[Revenueₕ]</div><div class="card-sub" style="margin-top:9px;">No Purchase contributes €0. The quantity terms are observed conditional average quantities for each household, so this is an illustrative revenue layer rather than a structural quantity-demand model.</div></div>',unsafe_allow_html=True)
+
+st.markdown('<div class="card" style="margin-top:16px;"><div class="card-title">Household revenue breakdown</div><div class="card-sub">Expected revenue at the current price scenario for each household.</div></div>',unsafe_allow_html=True)
+rev_rows=[]
+for h,r in household_revenues.items():
+    rev_rows.append({"Household":h,"Expected Regular Revenue":round(r["Regular"],2),"Expected Premium Revenue":round(r["Premium"],2),"Expected Total Revenue":round(r["Total"],2)})
+rev_rows.append({"Household":"Total","Expected Regular Revenue":round(sum(r["Regular"] for r in household_revenues.values()),2),"Expected Premium Revenue":round(sum(r["Premium"] for r in household_revenues.values()),2),"Expected Total Revenue":round(total_expected_revenue,2)})
+st.dataframe(pd.DataFrame(rev_rows),use_container_width=True,hide_index=True)
 
 if hits: st.markdown(f'<div class="warning"><b>Identification warning.</b> {", ".join(hits)} reached the ±20 optimisation bound. With only 11 observations and missing choice categories, these parameters are weakly identified. Treat the associated estimates as exploratory rather than precise economic effects.</div>',unsafe_allow_html=True)
 
@@ -161,21 +173,26 @@ There is no closed-form MNL solution, so the model uses **L-BFGS-B** numerical o
 ### 10. Calculate scenario probabilities
 For the selected household and prices, the fitted utilities are converted into probabilities for Regular, Premium, and No Purchase.
 
-### 11. Calculate expected revenue
-For the selected scenario:
+### 11. Calculate expected revenue per household
+For each household at the selected price pair:
 
-`E[Revenue] = P(Regular) × P_Regular × E[Q | Regular] + P(Premium) × P_Premium × E[Q | Premium]`
+`E[Revenue_h] = P_h(Regular) × P_Regular × E[Q_h | Regular] + P_h(Premium) × P_Premium × E[Q_h | Premium]`
 
-No Purchase contributes zero revenue. The quantity terms are observed conditional average quantities from the household's 11 weeks.
+No Purchase contributes zero revenue.
 
-### 12. Derive the equal-utility boundaries
+### 12. Aggregate expected revenue across households
+`E[Revenue_Total] = Σ_h E[Revenue_h]`
+
+The dashboard therefore calculates household-level expected revenue first and then sums the three household values to obtain total expected revenue.
+
+### 13. Derive the equal-utility boundaries
 **Regular = No Purchase:** set `V_R = V_N = 0`.  
 **Premium = No Purchase:** set `V_P = V_N = 0`.  
 **Regular = Premium:** set `V_R = V_P`.
 
 The resulting equations are transformed back from standardized prices into euros for the chart.
 
-### 13. Limitations
+### 14. Limitations
 The independent household MNLs are based on only 11 observations per household. Some alternatives are never observed for some households, creating weak identification. The MNL also relies on the IIA assumption. The model is exploratory and the quantity/revenue layer is not a structural demand model.""")
 with st.expander("How should I read the boundaries?"): st.markdown("""- **Dashed vertical line:** Regular = No Purchase.
 - **Dashed horizontal line:** Premium = No Purchase.
