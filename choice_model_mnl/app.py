@@ -98,20 +98,119 @@ with i1: st.markdown('<div class="card"><div class="card-title">Utility specific
 with i2: st.markdown(f'<div class="card"><div class="card-title">Selected household parameters</div><div class="card-sub">{household}</div><div class="kpi-value">{asc_r:.2f} / {asc_p:.2f}</div><div class="card-sub">ASC Regular / Premium</div><div class="kpi-value">{beta_r:.2f} / {beta_p:.2f}</div><div class="card-sub">Price coefficient Regular / Premium</div></div>',unsafe_allow_html=True)
 with i3: st.markdown(f'<div class="card"><div class="card-title">Choice boundaries</div><div class="card-sub">Equal-utility thresholds in original price units.</div><div class="equation">Regular = Premium<br>Pₚ = {slope:.2f} × Pᵣ + {intercept:.1f}</div><div class="card-sub" style="margin-top:9px;">Regular = No Purchase: {rn:.1f} €</div><div class="card-sub">Premium = No Purchase: {pn:.1f} €</div></div>',unsafe_allow_html=True)
 if hits: st.markdown(f'<div class="warning"><b>Identification warning.</b> {", ".join(hits)} reached the ±20 optimisation bound. With only 11 observations and missing choice categories, these parameters are weakly identified. Treat the associated estimates as exploratory rather than precise economic effects.</div>',unsafe_allow_html=True)
+
 st.markdown('<div id="methodology"></div>',unsafe_allow_html=True);st.subheader("Model & methodology")
-with st.expander("How the MNL works"): st.markdown(f"""For **{household}**, the model is estimated independently from that household's 11 weekly choices.
+with st.expander("Step-by-step explanation"):
+    st.markdown(f"""### 1. Start with the original data
+- 11 weeks of observations for each of 3 households.
+- Each household therefore contributes **11 observations** to its own MNL.
+- Across the dataset there are **33 household-week observations**.
 
-The systematic utilities are:
-- `V_R = ASC_R + β_R × z_R`
-- `V_P = ASC_P + β_P × z_P`
-- `V_N = 0`
+### 2. Convert quantities into observed choices
+For every household-week:
+- Regular quantity > 0 → **Regular**
+- Otherwise Premium quantity > 0 → **Premium**
+- Otherwise → **No Purchase**
 
-The choice probabilities use the softmax function:
+The MNL therefore models three alternatives: **Regular, Premium, No Purchase**.
+
+### 3. Estimate one MNL separately for each household
+The dashboard fits an independent model for each household, giving each household its own ASC_Regular, ASC_Premium, Regular-price coefficient, and Premium-price coefficient.
+
+### 4. Standardize the prices
+`Z_R = (P_R − mean(P_R)) / SD(P_R)`  
+`Z_P = (P_P − mean(P_P)) / SD(P_P)`
+
+Across the 33 observations: Regular mean ≈ **€46.09**, SD ≈ **€8.48**; Premium mean ≈ **€81.73**, SD ≈ **€9.81**.
+
+Example: €40 Regular → Z_R ≈ −0.718; €70 Premium → Z_P ≈ −1.196.
+
+### 5. Define utility for each alternative
+No Purchase is the reference alternative:
+
+`V_R = ASC_R + β_R × Z_R`  
+`V_P = ASC_P + β_P × Z_P`  
+`V_N = 0`
+
+The ASCs capture baseline preference relative to No Purchase; the price coefficients determine how standardized prices enter utility.
+
+### 6. Convert utilities into probabilities using softmax
 `P(i) = exp(V_i) / [exp(V_R) + exp(V_P) + exp(V_N)]`
 
-The parameters are estimated by maximum likelihood: the optimiser searches for the parameter values that make the observed choices as probable as possible.
+For the initial parameter guess `[0, 0, −1, −1]` and Week 1 prices, the utilities are approximately V_R = 0.718, V_P = 1.196, V_N = 0, producing about 32.2% Regular, 52.0% Premium, and 15.7% No Purchase. These are **initial-guess probabilities**, before estimation.
 
-Price variables are standardised for numerical stability; the boundaries are transformed back into euros for the chart.""")
+### 7. Compare predicted probabilities with observed choices
+For each week, the model takes the probability assigned to the choice that actually occurred. For example, an observed Premium choice contributes P(Premium) to the likelihood.
+
+### 8. Build the negative log-likelihood
+The model minimizes:
+
+`NLL = −Σ log(P_observed)`
+
+Lower NLL means the model assigns greater probability to the observed choices.
+
+### 9. Estimate the parameters numerically
+There is no closed-form MNL solution, so the model uses **L-BFGS-B** numerical optimization, parameter bounds of **−20 to +20**, and three different starting points. The result with the lowest NLL is retained.
+
+The ±20 bounds are numerical safeguards. A parameter reaching ±20 is an **identification warning**, not evidence that the true parameter equals ±20.
+
+### 10. Example of the estimated model
+For Household 2, approximate estimates are:
+- ASC_Regular = **2.003**
+- ASC_Premium = **−1.103**
+- β_Regular = **−0.514**
+- β_Premium = **−3.807**
+
+Therefore:
+
+`V_R = 2.003 − 0.514 Z_R`  
+`V_P = −1.103 − 3.807 Z_P`  
+`V_N = 0`
+
+### 11. Calculate final probabilities for a scenario
+For Household 2, Week 1:
+- Z_R ≈ −0.718
+- Z_P ≈ −1.196
+
+Utilities are approximately V_R = 2.372, V_P = 3.449, V_N = 0. Softmax then gives approximately **25.3% Regular, 74.0% Premium, and 0.9% No Purchase**.
+
+### 12. Derive the equal-utility boundaries
+Unlike Model 1, these are **equal-utility boundaries**, not 50% logistic prediction contours.
+
+**Regular = No Purchase:** set `V_R = V_N = 0`.  
+**Premium = No Purchase:** set `V_P = V_N = 0`.  
+**Regular = Premium:** set `V_R = V_P`.
+
+The resulting equations are transformed back from standardized prices into euros for the chart.
+
+### 13. Create the decision map
+The model evaluates many Regular/Premium price combinations. For each pair it calculates all three utilities, converts them to probabilities, and assigns the alternative with the highest probability to the corresponding region.
+
+### 14. Add observed choices
+The actual weekly choices are plotted over the model-implied regions, allowing a visual comparison between observed behavior and predicted choice regions.
+
+### 15. Add the quantity layer
+The dashboard reports observed quantity statistics. An illustrative expected-quantity expression is:
+
+`E[Q] = P(Regular) × E[Q | Regular] + P(Premium) × E[Q | Premium] + P(No Purchase) × 0`
+
+This is a quantity layer for interpretation, not a structural quantity-demand model.
+
+### 16. Identification and limitations
+Observed choices are:
+
+| Household | Regular | Premium | No Purchase |
+|---|---:|---:|---:|
+| Household 1 | 7 | 4 | 0 |
+| Household 2 | 7 | 4 | 0 |
+| Household 3 | 0 | 7 | 4 |
+
+Households 1 and 2 have no observed No Purchase choices, while Household 3 has no observed Regular choices. With only 11 observations per household, some parameters can be weakly identified and may hit the optimization bounds.
+
+The MNL is also subject to the **IIA assumption**. The model is exploratory and has not been validated as a causal demand model; coefficients should not automatically be interpreted as validated causal price elasticities or willingness-to-pay estimates.
+
+**Key flow:** Raw data → observed choices → standardize prices → define utilities → softmax probabilities → compare with observed choices → negative log-likelihood → numerical optimization → household-specific parameters → final probabilities → equal-utility boundaries → decision map.
+""")
 with st.expander("How should I read the boundaries?"): st.markdown("""- **Dashed vertical line:** Regular = No Purchase.
 - **Dashed horizontal line:** Premium = No Purchase.
 - **Solid diagonal line:** Regular = Premium.
