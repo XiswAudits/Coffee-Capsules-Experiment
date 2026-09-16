@@ -48,6 +48,17 @@ def boundaries(model):
     else:slope,intercept=np.nan,np.nan
     return rn,pn,slope,intercept
 
+def quantity_stats(frame):
+    regular=frame.loc[frame.Choice=="Regular","Regular"];premium=frame.loc[frame.Choice=="Premium","Premium"]
+    return float(frame.Quantity.mean()),float(regular.mean()) if len(regular) else 0.,float(premium.mean()) if len(premium) else 0.
+
+def expected_revenue(model,regular_price,premium_price):
+    scenario=probabilities(model,regular_price,premium_price)
+    _,regular_qty,premium_qty=quantity_stats(model["sample"])
+    regular_revenue=scenario["Regular"]*regular_price*regular_qty
+    premium_revenue=scenario["Premium"]*premium_price*premium_qty
+    return {"Regular":regular_revenue,"Premium":premium_revenue,"Total":regular_revenue+premium_revenue,"Regular_Qty":regular_qty,"Premium_Qty":premium_qty}
+
 def decision_map(household,regular_price,premium_price):
     model=MODELS[household];sample=model["sample"];xs=np.linspace(30,70,180);ys=np.linspace(55,145,180);xx,yy=np.meshgrid(xs,ys);probs=softmax(utility(model["params"],xx.ravel(),yy.ravel()));region=probs.argmax(axis=1).reshape(xx.shape)
     fig=go.Figure(go.Heatmap(x=xs,y=ys,z=region,zmin=0,zmax=2,colorscale=[[0,"rgba(22,119,255,.12)"],[.33,"rgba(22,119,255,.12)"],[.34,"rgba(255,138,31,.10)"],[.66,"rgba(255,138,31,.10)"],[.67,"rgba(170,180,192,.12)"],[1,"rgba(170,180,192,.12)"]],showscale=False,hoverinfo="skip"))
@@ -64,9 +75,6 @@ def decision_map(household,regular_price,premium_price):
     scenario=probabilities(model,regular_price,premium_price);predicted=max(CHOICES,key=scenario.get);fig.add_trace(go.Scatter(x=[regular_price],y=[premium_price],mode="markers",name="Scenario",marker={"symbol":"star","size":18,"color":"#172033","line":{"color":"white","width":2}}))
     fig.update_layout(height=500,margin={"l":10,"r":10,"t":20,"b":10},paper_bgcolor="white",plot_bgcolor="white",font={"family":"Inter, Arial, sans-serif","color":"#172033"},xaxis={"title":"Regular price (€)","range":[30,70],"gridcolor":"#e8edf3","zeroline":False,"fixedrange":True},yaxis={"title":"Premium price (€)","range":[55,145],"gridcolor":"#e8edf3","zeroline":False,"fixedrange":True},legend={"orientation":"h","y":1.04,"x":0},hoverlabel={"bgcolor":"white"})
     return fig,scenario,predicted
-
-def quantity_stats(frame):
-    regular=frame.loc[frame.Choice=="Regular","Regular"];premium=frame.loc[frame.Choice=="Premium","Premium"];return float(frame.Quantity.mean()),float(regular.mean()) if len(regular) else 0.,float(premium.mean()) if len(premium) else 0.
 
 st.markdown("""
 <style>
@@ -87,16 +95,20 @@ with sc1: household=st.selectbox("Household",list(HOUSEHOLDS),key="mnl_household
 with sc2: regular_price=st.slider("Regular price (€)",30,70,BASELINE_R,key="mnl_regular_price")
 with sc3: premium_price=st.slider("Premium price (€)",65,105,BASELINE_P,key="mnl_premium_price")
 
-fig,scenario,predicted=decision_map(household,regular_price,premium_price);model=MODELS[household];avg_qty,regular_qty,premium_qty=quantity_stats(model["sample"]);rn,pn,slope,intercept=boundaries(model);asc_r,asc_p,beta_r,beta_p=model["params"];hits=[n for n,v in model["at_bound"].items() if v];counts=model["observed_counts"]
-st.markdown(f'<div class="hero"><div class="hero-copy"><div class="eyebrow">Multinomial logit model</div><h1>Household Choice<br>Model</h1><p>Estimate choice probabilities and equal-utility boundaries for Regular, Premium, and No Purchase using an independent MNL for each household.</p></div></div>',unsafe_allow_html=True)
+fig,scenario,predicted=decision_map(household,regular_price,premium_price);model=MODELS[household];avg_qty,regular_qty,premium_qty=quantity_stats(model["sample"]);revenue=expected_revenue(model,regular_price,premium_price);rn,pn,slope,intercept=boundaries(model);asc_r,asc_p,beta_r,beta_p=model["params"];hits=[n for n,v in model["at_bound"].items() if v];counts=model["observed_counts"]
+st.markdown(f'<div class="hero"><div class="hero-copy"><div class="eyebrow">Multinomial logit model</div><h1>Household Choice<br>Model</h1><p>Estimate choice probabilities, expected revenue, and equal-utility boundaries for Regular, Premium, and No Purchase using an independent MNL for each household.</p></div></div>',unsafe_allow_html=True)
 m1,m2,m3,m4=st.columns(4);m1.metric("Most likely choice",predicted);m2.metric("P(Regular)",f"{scenario['Regular']:.0%}");m3.metric("P(Premium)",f"{scenario['Premium']:.0%}");m4.metric("P(No Purchase)",f"{scenario['No Purchase']:.0%}")
 st.markdown('<div id="model"></div>',unsafe_allow_html=True);left,right=st.columns([1.65,.8],gap="medium")
 with left: st.markdown('<div class="card"><div class="card-title">Choice map</div><div class="card-sub">Observed choices, model-implied utility boundaries, and the current price scenario.</div></div>',unsafe_allow_html=True);st.plotly_chart(fig,use_container_width=True,config={"displayModeBar":False,"responsive":True})
-with right: st.markdown(f'<div class="insight"><div class="eyebrow">Scenario result</div><h2>{predicted}</h2><p>At Regular €{regular_price} and Premium €{premium_price}</p><div style="height:12px"></div><div class="prob-row"><span>Regular</span><b>{scenario["Regular"]:.1%}</b></div><div class="prob-row"><span>Premium</span><b>{scenario["Premium"]:.1%}</b></div><div class="prob-row"><span>No Purchase</span><b>{scenario["No Purchase"]:.1%}</b></div></div>',unsafe_allow_html=True);st.write("");st.markdown(f'<div class="card"><div class="card-title">Model snapshot</div><div class="card-sub">{household} · 11 observations</div><div class="kpi-value">{model["nll"]:.1f}</div><div class="card-sub">negative log-likelihood</div><div style="height:8px"></div><span class="pill">Regular {counts.get("Regular",0)}</span><span class="pill">Premium {counts.get("Premium",0)}</span><span class="pill">No Purchase {counts.get("No Purchase",0)}</span></div>',unsafe_allow_html=True)
+with right: st.markdown(f'<div class="insight"><div class="eyebrow">Scenario result</div><h2>{predicted}</h2><p>At Regular €{regular_price} and Premium €{premium_price}</p><div style="height:12px"></div><div class="prob-row"><span>Regular</span><b>{scenario["Regular"]:.1%}</b></div><div class="prob-row"><span>Premium</span><b>{scenario["Premium"]:.1%}</b></div><div class="prob-row"><span>No Purchase</span><b>{scenario["No Purchase"]:.1%}</b></div></div>',unsafe_allow_html=True);st.write("");st.markdown(f'<div class="card"><div class="card-title">Expected revenue</div><div class="card-sub">Scenario revenue for {household}, using the MNL choice probabilities and observed conditional average quantities.</div><div class="kpi-value">€{revenue["Total"]:.2f}</div><div class="card-sub">total expected revenue</div><div style="height:8px"></div><span class="pill">Regular €{revenue["Regular"]:.2f}</span><span class="pill">Premium €{revenue["Premium"]:.2f}</span></div>',unsafe_allow_html=True)
+
 st.markdown('<div id="insights"></div>',unsafe_allow_html=True);i1,i2,i3=st.columns(3)
 with i1: st.markdown('<div class="card"><div class="card-title">Utility specification</div><div class="card-sub">No Purchase is the reference alternative.</div><div class="equation">Vᵣ = ASCᵣ + βᵣ · zᵣ</div><div class="equation">Vₚ = ASCₚ + βₚ · zₚ</div><div class="equation">Vₙ = 0</div></div>',unsafe_allow_html=True)
 with i2: st.markdown(f'<div class="card"><div class="card-title">Selected household parameters</div><div class="card-sub">{household}</div><div class="kpi-value">{asc_r:.2f} / {asc_p:.2f}</div><div class="card-sub">ASC Regular / Premium</div><div class="kpi-value">{beta_r:.2f} / {beta_p:.2f}</div><div class="card-sub">Price coefficient Regular / Premium</div></div>',unsafe_allow_html=True)
 with i3: st.markdown(f'<div class="card"><div class="card-title">Choice boundaries</div><div class="card-sub">Equal-utility thresholds in original price units.</div><div class="equation">Regular = Premium<br>Pₚ = {slope:.2f} × Pᵣ + {intercept:.1f}</div><div class="card-sub" style="margin-top:9px;">Regular = No Purchase: {rn:.1f} €</div><div class="card-sub">Premium = No Purchase: {pn:.1f} €</div></div>',unsafe_allow_html=True)
+
+st.markdown('<div class="card" style="margin-top:16px;"><div class="card-title">Expected revenue equation</div><div class="card-sub">At the selected price scenario, expected revenue combines the probability of each paid choice with its price and observed conditional average quantity.</div><div class="equation">E[Revenue] = P(Regular) × Pᵣ × E[Q | Regular] + P(Premium) × Pₚ × E[Q | Premium]</div><div class="card-sub" style="margin-top:9px;">No Purchase contributes €0. This quantity layer uses observed conditional averages, so it is illustrative rather than a structural quantity-demand model.</div></div>',unsafe_allow_html=True)
+
 if hits: st.markdown(f'<div class="warning"><b>Identification warning.</b> {", ".join(hits)} reached the ±20 optimisation bound. With only 11 observations and missing choice categories, these parameters are weakly identified. Treat the associated estimates as exploratory rather than precise economic effects.</div>',unsafe_allow_html=True)
 
 st.markdown('<div id="methodology"></div>',unsafe_allow_html=True);st.subheader("Model & methodology")
@@ -123,8 +135,6 @@ The dashboard fits an independent model for each household, giving each househol
 
 Across the 33 observations: Regular mean ≈ **€46.09**, SD ≈ **€8.48**; Premium mean ≈ **€81.73**, SD ≈ **€9.81**.
 
-Example: €40 Regular → Z_R ≈ −0.718; €70 Premium → Z_P ≈ −1.196.
-
 ### 5. Define utility for each alternative
 No Purchase is the reference alternative:
 
@@ -137,14 +147,10 @@ The ASCs capture baseline preference relative to No Purchase; the price coeffici
 ### 6. Convert utilities into probabilities using softmax
 `P(i) = exp(V_i) / [exp(V_R) + exp(V_P) + exp(V_N)]`
 
-For the initial parameter guess `[0, 0, −1, −1]` and Week 1 prices, the utilities are approximately V_R = 0.718, V_P = 1.196, V_N = 0, producing about 32.2% Regular, 52.0% Premium, and 15.7% No Purchase. These are **initial-guess probabilities**, before estimation.
-
 ### 7. Compare predicted probabilities with observed choices
-For each week, the model takes the probability assigned to the choice that actually occurred. For example, an observed Premium choice contributes P(Premium) to the likelihood.
+For each week, the model takes the probability assigned to the choice that actually occurred.
 
 ### 8. Build the negative log-likelihood
-The model minimizes:
-
 `NLL = −Σ log(P_observed)`
 
 Lower NLL means the model assigns greater probability to the observed choices.
@@ -152,65 +158,25 @@ Lower NLL means the model assigns greater probability to the observed choices.
 ### 9. Estimate the parameters numerically
 There is no closed-form MNL solution, so the model uses **L-BFGS-B** numerical optimization, parameter bounds of **−20 to +20**, and three different starting points. The result with the lowest NLL is retained.
 
-The ±20 bounds are numerical safeguards. A parameter reaching ±20 is an **identification warning**, not evidence that the true parameter equals ±20.
+### 10. Calculate scenario probabilities
+For the selected household and prices, the fitted utilities are converted into probabilities for Regular, Premium, and No Purchase.
 
-### 10. Example of the estimated model
-For Household 2, approximate estimates are:
-- ASC_Regular = **2.003**
-- ASC_Premium = **−1.103**
-- β_Regular = **−0.514**
-- β_Premium = **−3.807**
+### 11. Calculate expected revenue
+For the selected scenario:
 
-Therefore:
+`E[Revenue] = P(Regular) × P_Regular × E[Q | Regular] + P(Premium) × P_Premium × E[Q | Premium]`
 
-`V_R = 2.003 − 0.514 Z_R`  
-`V_P = −1.103 − 3.807 Z_P`  
-`V_N = 0`
-
-### 11. Calculate final probabilities for a scenario
-For Household 2, Week 1:
-- Z_R ≈ −0.718
-- Z_P ≈ −1.196
-
-Utilities are approximately V_R = 2.372, V_P = 3.449, V_N = 0. Softmax then gives approximately **25.3% Regular, 74.0% Premium, and 0.9% No Purchase**.
+No Purchase contributes zero revenue. The quantity terms are observed conditional average quantities from the household's 11 weeks.
 
 ### 12. Derive the equal-utility boundaries
-Unlike Model 1, these are **equal-utility boundaries**, not 50% logistic prediction contours.
-
 **Regular = No Purchase:** set `V_R = V_N = 0`.  
 **Premium = No Purchase:** set `V_P = V_N = 0`.  
 **Regular = Premium:** set `V_R = V_P`.
 
 The resulting equations are transformed back from standardized prices into euros for the chart.
 
-### 13. Create the decision map
-The model evaluates many Regular/Premium price combinations. For each pair it calculates all three utilities, converts them to probabilities, and assigns the alternative with the highest probability to the corresponding region.
-
-### 14. Add observed choices
-The actual weekly choices are plotted over the model-implied regions, allowing a visual comparison between observed behavior and predicted choice regions.
-
-### 15. Add the quantity layer
-The dashboard reports observed quantity statistics. An illustrative expected-quantity expression is:
-
-`E[Q] = P(Regular) × E[Q | Regular] + P(Premium) × E[Q | Premium] + P(No Purchase) × 0`
-
-This is a quantity layer for interpretation, not a structural quantity-demand model.
-
-### 16. Identification and limitations
-Observed choices are:
-
-| Household | Regular | Premium | No Purchase |
-|---|---:|---:|---:|
-| Household 1 | 7 | 4 | 0 |
-| Household 2 | 7 | 4 | 0 |
-| Household 3 | 0 | 7 | 4 |
-
-Households 1 and 2 have no observed No Purchase choices, while Household 3 has no observed Regular choices. With only 11 observations per household, some parameters can be weakly identified and may hit the optimization bounds.
-
-The MNL is also subject to the **IIA assumption**. The model is exploratory and has not been validated as a causal demand model; coefficients should not automatically be interpreted as validated causal price elasticities or willingness-to-pay estimates.
-
-**Key flow:** Raw data → observed choices → standardize prices → define utilities → softmax probabilities → compare with observed choices → negative log-likelihood → numerical optimization → household-specific parameters → final probabilities → equal-utility boundaries → decision map.
-""")
+### 13. Limitations
+The independent household MNLs are based on only 11 observations per household. Some alternatives are never observed for some households, creating weak identification. The MNL also relies on the IIA assumption. The model is exploratory and the quantity/revenue layer is not a structural demand model.""")
 with st.expander("How should I read the boundaries?"): st.markdown("""- **Dashed vertical line:** Regular = No Purchase.
 - **Dashed horizontal line:** Premium = No Purchase.
 - **Solid diagonal line:** Regular = Premium.
@@ -220,5 +186,5 @@ with st.expander("How should I read the boundaries?"): st.markdown("""- **Dashed
 These are **equal-utility model boundaries**, not validated willingness-to-pay thresholds.""")
 with st.expander("Why independent household MNLs?"): st.markdown("""The independent specification lets the dashboard estimate a distinct preference structure for each household. The trade-off is statistical power: each household has only 11 observations, and some alternatives are never observed.
 
-This also means the model should be treated as an exploratory discrete-choice exercise rather than a validated causal demand model. Standard MNL assumptions, including IIA, should also be kept in mind.""")
+This means the model should be treated as an exploratory discrete-choice exercise rather than a validated causal demand model. Standard MNL assumptions, including IIA, should also be kept in mind.""")
 st.markdown('<div id="data"></div>',unsafe_allow_html=True);st.subheader("Observed weeks");sample=model["sample"][["T","P_Regular","P_Premium","Choice","Quantity"]].copy();sample.columns=["Week","Regular price","Premium price","Observed choice","Quantity"];st.dataframe(sample,use_container_width=True,hide_index=True);st.caption("33 total household-week observations · 11 observations per household · independent MNL estimates")
