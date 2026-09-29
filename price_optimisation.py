@@ -1,88 +1,61 @@
-"""Per-household linear programmes for revenue-maximising capsule prices.
+"""Whiteboard-style linear programme for coffee-capsule prices.
 
-The question the owner asks is which Premium price ``P`` and Regular price
-``R`` maximise profit. Capsule costs are not in the dataset, and quantities
-are not choice variables: each household's quantities are the predictions of
-its own OLS demand equations. The linear programme therefore maximises
-*revenue* and the only decision variables are the two prices. That coincides
-with profit maximisation only when marginal cost is zero or already sunk.
+Decision variables are the Regular price R and the Premium price P. Each
+household buys a fixed quantity of one product, so revenue is linear in the
+two prices. Which product they buy is a straight line in the R-P plane, fitted
+by OLS from the weekly data (a linear probability model). Product assignments
+are separate linear programmes; the best feasible one is kept.
 
-Revenue with linear demand is a quadratic function of ``(R, P)``. A linear
-programme cannot take that quadratic as its objective directly, so each solve
-is a successive linear programme: at a feasible reference price the quadratic
-is replaced by its first-order Taylor expansion, ``scipy.optimize.linprog``
-maximises that linear function (HiGHS minimises the negated gradient) inside
-the demand-and-price polytope cut by a trust box around the reference, and the
-step is accepted only when the true quadratic revenue does not fall. The trust
-box is what stops a single linear objective from jumping to a corner of the
-price region. One linear programme over the whole polytope would be optimal
-at a vertex, and the revenue maximum for a household with a concave hill is
-interior.
+The earlier successive linear programme of quadratic OLS revenue has been
+retired. This module is the only price model the app uses.
 
-The programme is solved separately for every household. Households do not
-share demand coefficients, so they do not share the half-planes on which
-predicted demand hits zero (the household stops buying that capsule). An
-optional common-price solve is reported alongside the separate optima for
-comparison; it is not a substitute for the per-household programmes.
-
-Constraints exist to keep the solution out of two unusable regions: prices
-running to infinity, and prices at which the linear demand prediction is
-negative. They are not a cost function.
-
-Run ``python price_optimisation.py`` to fit the OLS equations on
-``coffee_capsules_data.csv``, solve every household, and compare each LP
-solution with the exact maximum of the quadratic on the same polygon.
+Class-board numbers are not copied from anywhere. Slopes, intercepts, and
+quantities are estimated here.
 """
 
 from __future__ import annotations
 
-from pathlib import Path
-
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
+from sklearn.linear_model import LinearRegression
 from scipy.optimize import linprog
 
-ROOT = Path(__file__).resolve().parent
-DEFAULT_DATA = ROOT / "coffee_capsules_data.csv"
-
-# Upper price guardrail = observed maximum + this many sample standard
-# deviations. It is a bound on the decision variables, not a demand
-# coefficient. One standard deviation sits just outside the experiment so a
-# household whose revenue hill is near the edge of the sample (Household 1)
-# is not truncated, while a household whose quadratic is unbounded in a price
-# (Households 2 and 3) cannot send that price to infinity.
-DEFAULT_UPPER_SD_MULTIPLIER = 1.0
-UPPER_SD_MULTIPLIERS = (0.0, 1.0, 2.0)
-
-TRUST_INIT_FRACTION = 0.25
-TRUST_GROW = 1.5
-TRUST_SHRINK = 0.5
-TRUST_MIN = 1e-7
-STATIONARY_STEP = 1e-6
-MAX_ITER = 80
-FEASIBILITY_TOL = 1e-7
-# Directional derivative of revenue toward the best feasible vertex, in euros.
-# Below this, the first-order linear model has nothing left to gain.
-STATIONARITY_TOL = 1e-3
-
-COEF_NAMES = ("a_R", "b_RR", "b_RP", "a_P", "b_PR", "b_PP")
-
 FORMULATION_SUMMARY = """
-The owner's question is the optimal Premium price P and Regular price R to maximise profit. Costs are not observed, so the linear programme maximises revenue by changing only those two prices. Predicted quantities come from household-specific OLS demand and are not decision variables. Revenue with linear demand is quadratic, so the solver uses a successive first-order Taylor linearisation (a trust-region linear programme at each step). scipy.optimize.linprog minimises, therefore the objective vector is the negated revenue gradient. Constraints are rebuilt for every household from that household's OLS coefficients: predicted Regular quantity >= 0, predicted Premium quantity >= 0, and price bounds R >= 0, P >= 0 plus a finite upper guardrail taken from the observed prices. Those constraints stop prices going to infinity or into a region where the household's predicted demand turns negative and it stops buying. Each household is its own programme because the coefficients, and therefore the demand boundaries, differ.
+Decision variables are the Regular price R and the Premium price P, both non-negative.
+
+Each household buys a fixed quantity of one product (the average units bought on weeks they chose that product). Revenue is therefore linear: quantity times the price of the product they buy.
+
+The product is not a decision variable inside one programme. Each household is a straight line in the R-P plane, fitted by OLS (a linear probability model at the 0.5 contour). One side of the line is Premium, the other is Regular, and a household that sometimes buys nothing also has a stop-buying line. Each assignment of products to households is its own linear programme. The assignment with the highest feasible revenue is the shared menu.
+
+`scipy.optimize.linprog` minimises, so the objective vector is the negated quantity vector. Upper price bounds are the highest Regular and Premium prices in the experiment, so a price cannot run off to infinity. Those bounds are data, not demand coefficients.
 """.strip()
 
+LINE_STYLE = {
+    "Household 1": "solid",
+    "Household 2": "dash",
+    "Household 3": "longdashdot",
+}
+LINE_COLOR = {
+    "Household 1": "#172033",
+    "Household 2": "#1677ff",
+    "Household 3": "#ff8a1f",
+}
+_TOL = 1e-7
 
-def resolve_data_path(path=None) -> Path:
-    if path is None:
-        return DEFAULT_DATA
-    candidate = Path(path)
-    if candidate.is_file():
-        return candidate
-    alongside = ROOT / candidate
-    if alongside.is_file():
-        return alongside
-    return candidate
+
+def discover_households(frame: pd.DataFrame) -> list[str]:
+    """Column prefixes that have both a Regular and a Premium quantity."""
+    found = []
+    for col in frame.columns:
+        if not str(col).endswith("_Regular") or col == "P_Regular":
+            continue
+        prefix = str(col)[: -len("_Regular")]
+        if prefix == "P":
+            continue
+        if f"{prefix}_Premium" in frame.columns:
+            found.append(prefix)
+    return found
 
 
 def household_label(prefix: str) -> str:
@@ -91,1638 +64,881 @@ def household_label(prefix: str) -> str:
     return prefix
 
 
-def discover_households(frame: pd.DataFrame) -> list[tuple[str, str, str]]:
-    """Return ``(label, regular_quantity_column, premium_quantity_column)``.
-
-    ``P_Regular`` and ``P_Premium`` are the prices faced by every household,
-    not a household's purchased quantities. They share the ``_Regular`` /
-    ``_Premium`` suffix, so they are excluded by name.
-    """
-    pairs = []
-    for column in frame.columns:
-        if column == "P_Regular" or not str(column).endswith("_Regular"):
-            continue
-        prefix = column[: -len("_Regular")]
-        premium = f"{prefix}_Premium"
-        if premium == "P_Premium" or premium not in frame.columns:
-            continue
-        pairs.append((household_label(prefix), column, premium))
-    if not pairs:
-        raise ValueError(
-            "Expected household quantity columns named {id}_Regular and {id}_Premium."
-        )
-    return pairs
+def _fit_lpm(prices: np.ndarray, target: np.ndarray) -> dict:
+    """OLS linear probability model. Returns intercept and slopes on R and P."""
+    model = LinearRegression()
+    model.fit(prices, target)
+    fitted = model.predict(prices)
+    resid = target - fitted
+    ss_tot = float(np.sum((target - target.mean()) ** 2))
+    r2 = float(1.0 - np.sum(resid**2) / ss_tot) if ss_tot > 1e-15 else float("nan")
+    return {
+        "intercept": float(model.intercept_),
+        "b_R": float(model.coef_[0]),
+        "b_P": float(model.coef_[1]),
+        "r_squared": r2,
+    }
 
 
-def load_prices(frame: pd.DataFrame) -> tuple[np.ndarray, np.ndarray]:
-    missing = [name for name in ("P_Regular", "P_Premium") if name not in frame.columns]
-    if missing:
-        raise ValueError(f"Price column(s) missing from the dataset: {missing}")
+def _score(line: dict, regular: float, premium: float) -> float:
+    return line["intercept"] + line["b_R"] * regular + line["b_P"] * premium
+
+
+def line_equation(line: dict) -> str:
+    """0.5 contour written as P = slope·R + intercept, or a vertical R line."""
+    intercept, b_r, b_p = line["intercept"], line["b_R"], line["b_P"]
+    if abs(b_p) < 1e-12:
+        if abs(b_r) < 1e-12:
+            return "score does not depend on price"
+        level = (0.5 - intercept) / b_r
+        return f"R = {level:.4f}"
+    slope = -b_r / b_p
+    icept = (0.5 - intercept) / b_p
+    sign = "+" if icept >= 0 else "−"
+    return f"P = {slope:.4f} R {sign} {abs(icept):.4f}"
+
+
+def _halfspace(line: dict, side: str) -> tuple[np.ndarray, float]:
+    """score >= 0.5 (`high`) or score <= 0.5 (`low`) as one row of A_ub x <= b."""
+    intercept, b_r, b_p = line["intercept"], line["b_R"], line["b_P"]
+    if side == "high":
+        return np.array([-b_r, -b_p], dtype=float), intercept - 0.5
+    if side == "low":
+        return np.array([b_r, b_p], dtype=float), 0.5 - intercept
+    raise ValueError(side)
+
+
+def inequality_text(line: dict, side: str) -> str:
+    """Human reading of the half-space, as a bound on P or on R."""
+    intercept, b_r, b_p = line["intercept"], line["b_R"], line["b_P"]
+    if abs(b_p) < 1e-12:
+        level = (0.5 - intercept) / b_r if abs(b_r) > 1e-12 else float("nan")
+        wants_low_r = (side == "high" and b_r < 0) or (side == "low" and b_r > 0)
+        op = "<=" if wants_low_r else ">="
+        return f"R {op} {level:.4f}"
+    slope = -b_r / b_p
+    icept = (0.5 - intercept) / b_p
+    wants_below = (side == "high" and b_p < 0) or (side == "low" and b_p > 0)
+    op = "<=" if wants_below else ">="
+    sign = "+" if icept >= 0 else "−"
+    return f"P {op} {slope:.4f} R {sign} {abs(icept):.4f}"
+
+
+def load_problem(csv_path: str = "coffee_capsules_data.csv") -> dict:
+    """Fit one line per household and the fixed quantities, plus price bounds."""
+    frame = pd.read_csv(csv_path)
     regular = frame["P_Regular"].to_numpy(dtype=float)
     premium = frame["P_Premium"].to_numpy(dtype=float)
-    return regular, premium
-
-
-def fit_ols(quantity, regular_price, premium_price) -> dict:
-    """OLS of one capsule's quantity on an intercept, R, and P.
-
-    The slope on R and the slope on P are whichever price is in that
-    equation. Mapping them into ``(a_R, b_RR, b_RP, a_P, b_PR, b_PP)`` is
-    done by the caller so the cross-price names stay unambiguous.
-    """
-    y = np.asarray(quantity, dtype=float)
-    regular = np.asarray(regular_price, dtype=float)
-    premium = np.asarray(premium_price, dtype=float)
-    design = np.column_stack([np.ones(len(y)), regular, premium])
-    beta, _residuals, rank, _singular = np.linalg.lstsq(design, y, rcond=None)
-    # An identically zero series has a zero coefficient vector. Forcing it
-    # avoids a numerical dust row that would make "quantity >= 0" look like
-    # a real price restriction.
-    if np.allclose(y, 0.0):
-        beta = np.zeros(3, dtype=float)
-    fitted = design @ beta
-    total = float(np.sum((y - y.mean()) ** 2))
-    residual = float(np.sum((y - fitted) ** 2))
-    r_squared = np.nan if total < 1e-12 else 1.0 - residual / total
-    return {
-        "a": float(beta[0]),
-        "b_R": float(beta[1]),
-        "b_P": float(beta[2]),
-        "r_squared": float(r_squared) if np.isfinite(r_squared) else np.nan,
-        "rank": int(rank),
-        "n": int(len(y)),
-        "always_zero": bool(np.allclose(y, 0.0)),
-    }
-
-
-def fit_household(quantity_regular, quantity_premium, regular_price, premium_price) -> dict:
-    """Two independent OLS fits. Coefficients are entirely data-determined."""
-    regular = fit_ols(quantity_regular, regular_price, premium_price)
-    premium = fit_ols(quantity_premium, regular_price, premium_price)
-    # Q_R = a_R + b_RR R + b_RP P
-    # Q_P = a_P + b_PR R + b_PP P
-    coef = (
-        regular["a"],
-        regular["b_R"],
-        regular["b_P"],
-        premium["a"],
-        premium["b_R"],
-        premium["b_P"],
-    )
-    return {
-        "coef": coef,
-        "r_squared_regular": regular["r_squared"],
-        "r_squared_premium": premium["r_squared"],
-        "rank_regular": regular["rank"],
-        "rank_premium": premium["rank"],
-        "n": regular["n"],
-        "regular_always_zero": regular["always_zero"],
-        "premium_always_zero": premium["always_zero"],
-    }
-
-
-def coef_from_mapping(mapping) -> tuple[float, float, float, float, float, float]:
-    return tuple(float(mapping[name]) for name in COEF_NAMES)
-
-
-def quantities(prices, coef) -> tuple[float, float]:
-    regular_price, premium_price = np.asarray(prices, dtype=float)
-    a_R, b_RR, b_RP, a_P, b_PR, b_PP = coef
-    q_regular = a_R + b_RR * regular_price + b_RP * premium_price
-    q_premium = a_P + b_PR * regular_price + b_PP * premium_price
-    return float(q_regular), float(q_premium)
-
-
-def revenue(prices, coef) -> float:
-    """Quadratic revenue R * Q_R(R, P) + P * Q_P(R, P)."""
-    regular_price, premium_price = np.asarray(prices, dtype=float)
-    q_regular, q_premium = quantities(prices, coef)
-    return float(regular_price * q_regular + premium_price * q_premium)
-
-
-def gradient(prices, coef) -> np.ndarray:
-    """Analytical gradient of quadratic revenue with respect to (R, P).
-
-    dRev/dR = Q_R + R * dQ_R/dR + P * dQ_P/dR
-    dRev/dP = Q_P + P * dQ_P/dP + R * dQ_R/dP
-    """
-    regular_price, premium_price = np.asarray(prices, dtype=float)
-    _a_R, b_RR, b_RP, _a_P, b_PR, b_PP = coef
-    q_regular, q_premium = quantities(prices, coef)
-    d_regular = q_regular + regular_price * b_RR + premium_price * b_PR
-    d_premium = q_premium + premium_price * b_PP + regular_price * b_RP
-    return np.array([d_regular, d_premium], dtype=float)
-
-
-def hessian(coef) -> np.ndarray:
-    _a_R, b_RR, b_RP, _a_P, b_PR, b_PP = coef
-    cross = b_RP + b_PR
-    return np.array([[2.0 * b_RR, cross], [cross, 2.0 * b_PP]], dtype=float)
-
-
-def revenue_is_concave(coef) -> bool:
-    eigenvalues = np.linalg.eigvalsh(hessian(coef))
-    return bool(np.all(eigenvalues <= 1e-8))
-
-
-def linear_objective_vector(revenue_gradient) -> np.ndarray:
-    """Objective vector for ``linprog``.
-
-    ``linprog`` minimises ``c @ x``. Maximising the linearised revenue
-    ``g @ x`` is the same programme with ``c = -g``.
-    """
-    return -np.asarray(revenue_gradient, dtype=float)
-
-
-def price_bounds_from_sample(regular_price, premium_price, sd_multiplier: float) -> dict:
-    """Finite price box used to stop an otherwise unbounded price.
-
-    Lower bounds are 0, as required. Upper bounds are the observed maximum
-    plus ``sd_multiplier`` sample standard deviations of that price. The
-    multiplier is a guardrail choice; the location of the guardrail is
-    calculated from the sample, not typed in as a demand coefficient.
-    """
-    regular = np.asarray(regular_price, dtype=float)
-    premium = np.asarray(premium_price, dtype=float)
-    regular_sd = float(np.std(regular, ddof=1)) if len(regular) > 1 else 0.0
-    premium_sd = float(np.std(premium, ddof=1)) if len(premium) > 1 else 0.0
-    return {
+    prices = np.column_stack([regular, premium])
+    r_sd = float(np.std(regular, ddof=1))
+    p_sd = float(np.std(premium, ddof=1))
+    bounds = {
         "R_lower": 0.0,
-        "R_upper": float(np.max(regular) + sd_multiplier * regular_sd),
         "P_lower": 0.0,
-        "P_upper": float(np.max(premium) + sd_multiplier * premium_sd),
-        "R_observed_min": float(np.min(regular)),
-        "R_observed_max": float(np.max(regular)),
-        "P_observed_min": float(np.min(premium)),
-        "P_observed_max": float(np.max(premium)),
-        "R_observed_mean": float(np.mean(regular)),
-        "P_observed_mean": float(np.mean(premium)),
-        "upper_sd_multiplier": float(sd_multiplier),
+        "R_upper": float(np.max(regular)),
+        "P_upper": float(np.max(premium)),
+        "R_sd": r_sd,
+        "P_sd": p_sd,
     }
+    households = []
+    for prefix in discover_households(frame):
+        label = household_label(prefix)
+        reg_qty = frame[f"{prefix}_Regular"].to_numpy(dtype=float)
+        prem_qty = frame[f"{prefix}_Premium"].to_numpy(dtype=float)
+        bought_reg = reg_qty > 0
+        bought_prem = prem_qty > 0
+        bought = bought_reg | bought_prem
+        d_regular = float(reg_qty[bought_reg].mean()) if bought_reg.any() else 0.0
+        d_premium = float(prem_qty[bought_prem].mean()) if bought_prem.any() else 0.0
+        lines = []
+        if bought.any() and (~bought).any():
+            stop = _fit_lpm(prices, bought.astype(float))
+            stop["kind"] = "stop"
+            stop["equation"] = line_equation(stop)
+            lines.append(stop)
+        buyers = bought
+        if buyers.sum() >= 2 and bought_reg[buyers].any() and bought_prem[buyers].any():
+            switch_target = bought_prem[buyers].astype(float)
+            switch = _fit_lpm(prices[buyers], switch_target)
+            switch["kind"] = "switch"
+            switch["equation"] = line_equation(switch)
+            lines.append(switch)
+        predicted = [
+            predict_product({"lines": lines, "only_product": "Premium" if not bought_reg.any() else None}, r, p)
+            for r, p in zip(regular, premium)
+        ]
+        observed = np.where(bought_reg, "Regular", np.where(bought_prem, "Premium", "None"))
+        accuracy = float(np.mean([pred == obs for pred, obs in zip(predicted, observed)])) if len(observed) else float("nan")
+        households.append(
+            {
+                "label": label,
+                "prefix": prefix,
+                "lines": lines,
+                "d_regular": d_regular,
+                "d_premium": d_premium,
+                "n_regular": int(bought_reg.sum()),
+                "n_premium": int(bought_prem.sum()),
+                "n_none": int((~bought).sum()),
+                "only_product": None if bought_reg.any() else "Premium",
+                "accuracy": accuracy,
+            }
+        )
+    return {"households": households, "bounds": bounds, "frame": frame}
 
 
-def build_constraint_system(coef, price_bounds: dict) -> dict:
-    """Build ``A_ub @ x <= b_ub`` and solver bounds for ``x = [R, P]``.
+def product_choices(household: dict) -> list[str]:
+    """Products this household can be assigned, given the lines the data support."""
+    kinds = {line["kind"] for line in household["lines"]}
+    choices = []
+    if "switch" in kinds or household["d_regular"] > 0:
+        choices.append("Regular")
+    if household["d_premium"] > 0 or "switch" in kinds:
+        choices.append("Premium")
+    if "stop" in kinds:
+        choices.append("None")
+    if household["only_product"] == "Premium" and "Regular" in choices and "switch" not in kinds:
+        choices = [c for c in choices if c != "Regular"]
+    return choices
 
-    Rows are assembled from this household's OLS coefficients and from the
-    price box. Nothing here is a copied regression slope.
 
-    Demand, written as an upper bound:
-        Q_R >= 0  <=>  -b_RR R - b_RP P <= a_R
-        Q_P >= 0  <=>  -b_PR R - b_PP P <= a_P
-    Prices:
-        -R <= -R_lower,  -P <= -P_lower,  R <= R_upper,  P <= P_upper.
+def _sides_for(household: dict, product: str) -> list[tuple[dict, str]]:
+    """Behavioural half-spaces that keep `product` on the correct side of each line."""
+    kinds = {line["kind"]: line for line in household["lines"]}
+    sides = []
+    if product == "None":
+        if "stop" not in kinds:
+            raise ValueError(f"{household['label']} has no stop-buying line")
+        sides.append((kinds["stop"], "low"))
+        return sides
+    if "stop" in kinds:
+        sides.append((kinds["stop"], "high"))
+    if "switch" in kinds:
+        sides.append((kinds["switch"], "high" if product == "Premium" else "low"))
+    elif product == "Regular" and household["only_product"] == "Premium":
+        raise ValueError(f"{household['label']} never buys Regular")
+    return sides
 
-    A numerically zero demand row (quantity predicted to be identically zero)
-    is dropped when it is redundant, and reported as infeasible when it says
-    ``0 <= negative``.
-    """
-    a_R, b_RR, b_RP, a_P, b_PR, b_PP = coef
-    r_lower = float(price_bounds["R_lower"])
-    r_upper = float(price_bounds["R_upper"])
-    p_lower = float(price_bounds["P_lower"])
-    p_upper = float(price_bounds["P_upper"])
 
-    rows = [
-        (np.array([-b_RR, -b_RP], dtype=float), a_R, "Q_regular>=0"),
-        (np.array([-b_PR, -b_PP], dtype=float), a_P, "Q_premium>=0"),
-        (np.array([-1.0, 0.0], dtype=float), -r_lower, "R>=R_lower"),
-        (np.array([0.0, -1.0], dtype=float), -p_lower, "P>=P_lower"),
+def price_box_rows(bounds: dict) -> tuple[np.ndarray, np.ndarray, list[str]]:
+    rows = np.array(
+        [
+            [-1.0, 0.0],
+            [1.0, 0.0],
+            [0.0, -1.0],
+            [0.0, 1.0],
+        ]
+    )
+    rhs = np.array(
+        [
+            -bounds["R_lower"],
+            bounds["R_upper"],
+            -bounds["P_lower"],
+            bounds["P_upper"],
+        ],
+        dtype=float,
+    )
+    names = [
+        f"R >= {bounds['R_lower']:.4f}",
+        f"R <= {bounds['R_upper']:.4f}",
+        f"P >= {bounds['P_lower']:.4f}",
+        f"P <= {bounds['P_upper']:.4f}",
     ]
-    if np.isfinite(r_upper):
-        rows.append((np.array([1.0, 0.0], dtype=float), r_upper, "R<=R_upper"))
-    if np.isfinite(p_upper):
-        rows.append((np.array([0.0, 1.0], dtype=float), p_upper, "P<=P_upper"))
-
-    kept_rows = []
-    kept_rhs = []
-    kept_names = []
-    dropped = []
-    structurally_infeasible = False
-    for normal, rhs, name in rows:
-        if float(np.linalg.norm(normal)) < 1e-12:
-            if rhs < -1e-9:
-                structurally_infeasible = True
-                dropped.append(f"{name} (infeasible identity)")
-            else:
-                dropped.append(f"{name} (redundant identity)")
-            continue
-        kept_rows.append(normal)
-        kept_rhs.append(rhs)
-        kept_names.append(name)
-
-    A_ub = np.vstack(kept_rows) if kept_rows else np.zeros((0, 2))
-    b_ub = np.asarray(kept_rhs, dtype=float)
-    solver_bounds = [
-        (r_lower, None if not np.isfinite(r_upper) else r_upper),
-        (p_lower, None if not np.isfinite(p_upper) else p_upper),
-    ]
-    return {
-        "A_ub": A_ub,
-        "b_ub": b_ub,
-        "bounds": solver_bounds,
-        "names": kept_names,
-        "dropped": dropped,
-        "infeasible": structurally_infeasible,
-        "price_bounds": price_bounds,
-    }
+    return rows, rhs, names
 
 
-def is_feasible(prices, A_ub, b_ub, tol: float = FEASIBILITY_TOL) -> bool:
-    if A_ub.size == 0:
-        return True
-    return bool(np.all(A_ub @ np.asarray(prices, dtype=float) <= b_ub + tol))
+def build_constraint_system(households: list[dict], assignment: dict[str, str], bounds: dict) -> dict:
+    """Stack behavioural half-spaces and the price box into A_ub x <= b_ub."""
+    rows = []
+    rhs = []
+    names = []
+    for household in households:
+        product = assignment[household["label"]]
+        for line, side in _sides_for(household, product):
+            coeff, limit = _halfspace(line, side)
+            rows.append(coeff)
+            rhs.append(limit)
+            kind = "switches so that" if line["kind"] == "switch" else "keeps buying so that"
+            if product == "None":
+                kind = "stops buying so that"
+            names.append(f"{household['label']} {kind} {inequality_text(line, side)}")
+    box_rows, box_rhs, box_names = price_box_rows(bounds)
+    if rows:
+        matrix = np.vstack([np.vstack(rows), box_rows])
+        limits = np.concatenate([np.array(rhs, dtype=float), box_rhs])
+    else:
+        matrix = box_rows
+        limits = box_rhs
+    return {"A_ub": matrix, "b_ub": limits, "names": names + box_names}
 
 
-def _intersection(normal_i, rhs_i, normal_j, rhs_j):
-    matrix = np.vstack([normal_i, normal_j])
-    if abs(np.linalg.det(matrix)) < 1e-10:
-        return None
-    try:
-        point = np.linalg.solve(matrix, np.array([rhs_i, rhs_j], dtype=float))
-    except np.linalg.LinAlgError:
-        return None
-    if not np.all(np.isfinite(point)):
-        return None
-    return point
+def objective_coefficients(households: list[dict], assignment: dict[str, str]) -> np.ndarray:
+    """c such that revenue = c · [R, P]. None contributes nothing."""
+    c_r = 0.0
+    c_p = 0.0
+    for household in households:
+        product = assignment[household["label"]]
+        if product == "Regular":
+            c_r += household["d_regular"]
+        elif product == "Premium":
+            c_p += household["d_premium"]
+    return np.array([c_r, c_p], dtype=float)
 
 
-def dedupe_points(points, tol: float = 1e-6) -> list[np.ndarray]:
+def _vertices_from_constraints(matrix: np.ndarray, limits: np.ndarray) -> list[np.ndarray]:
+    points = []
+    n = len(limits)
+    for i in range(n):
+        for j in range(i + 1, n):
+            pair = np.vstack([matrix[i], matrix[j]])
+            if abs(np.linalg.det(pair)) < 1e-10:
+                continue
+            try:
+                point = np.linalg.solve(pair, np.array([limits[i], limits[j]], dtype=float))
+            except np.linalg.LinAlgError:
+                continue
+            if np.all(matrix @ point <= limits + 1e-6):
+                points.append(point)
     unique = []
     for point in points:
-        point = np.asarray(point, dtype=float)
-        if not np.all(np.isfinite(point)):
-            continue
-        if any(np.linalg.norm(point - kept) <= tol for kept in unique):
-            continue
-        unique.append(point)
+        if not any(np.linalg.norm(point - kept) < 1e-6 for kept in unique):
+            unique.append(point)
+    if not unique:
+        return []
+    centroid = np.mean(unique, axis=0)
+    unique.sort(key=lambda pt: np.arctan2(pt[1] - centroid[1], pt[0] - centroid[0]))
     return unique
 
 
-def polygon_vertices(A_ub, b_ub) -> list[np.ndarray]:
-    """Vertices of a 2-dimensional polyhedron, by pairwise binding constraints."""
-    if len(b_ub) < 2:
-        return []
-    found = []
-    for i in range(len(b_ub)):
-        for j in range(i + 1, len(b_ub)):
-            point = _intersection(A_ub[i], b_ub[i], A_ub[j], b_ub[j])
-            if point is not None and is_feasible(point, A_ub, b_ub):
-                found.append(point)
-    return dedupe_points(found)
+def _tight_constraints(matrix: np.ndarray, limits: np.ndarray, point: np.ndarray) -> list[int]:
+    slack = limits - matrix @ point
+    return [i for i, gap in enumerate(slack) if abs(gap) <= 1e-5]
 
 
-def _trust_bounds(prices, delta: float, solver_bounds):
-    (r_lower, r_upper), (p_lower, p_upper) = solver_bounds
-    r_upper = np.inf if r_upper is None else r_upper
-    p_upper = np.inf if p_upper is None else p_upper
-    r_lo = max(r_lower, float(prices[0]) - delta)
-    r_hi = min(r_upper, float(prices[0]) + delta)
-    p_lo = max(p_lower, float(prices[1]) - delta)
-    p_hi = min(p_upper, float(prices[1]) + delta)
-    if r_lo > r_hi:
-        r_lo = r_hi = float(np.clip(prices[0], r_lower, r_upper))
-    if p_lo > p_hi:
-        p_lo = p_hi = float(np.clip(prices[1], p_lower, p_upper))
-    return [(r_lo, r_hi), (p_lo, p_hi)]
-
-
-def _box_span(solver_bounds) -> tuple[float, bool]:
-    (r_lower, r_upper), (p_lower, p_upper) = solver_bounds
-    finite = (
-        r_upper is not None
-        and p_upper is not None
-        and np.isfinite(r_upper)
-        and np.isfinite(p_upper)
-    )
-    span = 0.0
-    if r_upper is not None and np.isfinite(r_upper):
-        span = max(span, float(r_upper) - float(r_lower))
-    if p_upper is not None and np.isfinite(p_upper):
-        span = max(span, float(p_upper) - float(p_lower))
-    if span <= 0:
-        span = 100.0
-    return span, finite
-
-
-def successive_linear_programme(revenue_fn, gradient_fn, system: dict, starts) -> dict:
-    """Maximise ``revenue_fn`` by a sequence of trust-region linear programmes.
-
-    At reference ``x0`` the linear programme is
-
-        minimise    c @ x
-        subject to  A_ub @ x <= b_ub
-                    x inside the trust box around x0 (passed as ``bounds``)
-
-    with ``c = -gradient_fn(x0)``. The true revenue, not the linear
-    surrogate, decides whether the step is kept. Repeating this is successive
-    linear programming (Griffith and Stewart, 1961): a local linear model of
-    a smooth nonlinear objective, re-centered until the trust box collapses.
-    Several feasible starts are used because a non-concave quadratic can have
-    its maximum on the boundary while the gradient still points at a poor vertex.
-    """
-    A_ub = system["A_ub"]
-    b_ub = system["b_ub"]
-    solver_bounds = system["bounds"]
-    if system["infeasible"]:
-        return _empty_solve("infeasible", "Demand constraints cannot be satisfied.")
-
-    span, _finite_box = _box_span(solver_bounds)
-    best = None
-
-    for start in dedupe_points(starts, tol=1e-5):
-        if not is_feasible(start, A_ub, b_ub):
-            continue
-        prices = np.asarray(start, dtype=float).copy()
-        delta = TRUST_INIT_FRACTION * span
-        iterations = 0
-        last_status = None
-        last_c = linear_objective_vector(gradient_fn(prices))
-        for _ in range(MAX_ITER):
-            iterations += 1
-            last_c = linear_objective_vector(gradient_fn(prices))
-            trust = _trust_bounds(prices, delta, solver_bounds)
-            result = linprog(last_c, A_ub=A_ub, b_ub=b_ub, bounds=trust, method="highs")
-            last_status = int(result.status)
-            # A trust box is bounded, so status 3 here is a numerical failure
-            # rather than an unbounded price. The structural unboundedness test
-            # is ``is_revenue_unbounded``, applied before this loop.
-            if result.status != 0:
-                delta *= TRUST_SHRINK
-                if delta < TRUST_MIN:
-                    break
+def _is_vertex(matrix: np.ndarray, limits: np.ndarray, point: np.ndarray) -> bool:
+    tight = _tight_constraints(matrix, limits, point)
+    for i in tight:
+        for j in tight:
+            if j <= i:
                 continue
-            proposal = np.asarray(result.x, dtype=float)
-            step = float(np.linalg.norm(proposal - prices))
-            proposed_revenue = float(revenue_fn(proposal))
-            current_revenue = float(revenue_fn(prices))
-            if proposed_revenue > current_revenue + 1e-9:
-                prices = proposal
-                full_trust_step = step >= 0.9 * delta * np.sqrt(2.0)
-                delta = min(delta * TRUST_GROW, span) if full_trust_step else (
-                    delta * TRUST_SHRINK if step < 0.3 * delta else delta
-                )
-            else:
-                delta *= TRUST_SHRINK
-            if step < STATIONARY_STEP and delta < 1e-3:
-                break
-
-        stationarity = _directional_improvement(gradient_fn, prices, system)
-        record = {
-            "prices": prices,
-            "revenue": float(revenue_fn(prices)),
-            "iterations": iterations,
-            "last_c": last_c,
-            "linprog_status": last_status if last_status is not None else stationarity["status"],
-            "directional_improvement": stationarity["improvement"],
-            "converged": bool(
-                np.isfinite(stationarity["improvement"])
-                and stationarity["improvement"] <= STATIONARITY_TOL
-            ),
-        }
-        if best is None or record["revenue"] > best["revenue"] + 1e-8:
-            best = record
-
-    if best is None:
-        return _empty_solve(
-            "infeasible",
-            "No price inside the bounds keeps predicted demand non-negative.",
-        )
-
-    status = "optimal" if best["converged"] else "iteration_limit"
-    message = {
-        "optimal": "Successive linear programme converged to a first-order point.",
-        "iteration_limit": "Iteration limit reached before the trust region collapsed.",
-    }[status]
-    return {
-        "status": status,
-        "message": message,
-        "prices": best["prices"],
-        "revenue": best["revenue"],
-        "iterations": best["iterations"],
-        "objective_c": best["last_c"],
-        "linprog_status": best["linprog_status"],
-        "directional_improvement": best["directional_improvement"],
-        "converged": best["converged"],
-    }
-
-
-def _directional_improvement(gradient_fn, prices, system) -> dict:
-    """Best linearised gain ``g @ (z - x)`` over the full structural polytope.
-
-    This is the LP the user-facing solve reduces to once the trust region has
-    collapsed: same ``A_ub``, ``b_ub``, and price bounds, objective ``c = -g``.
-    A non-positive value means no feasible direction improves the linear model.
-    """
-    gradient_at_prices = np.asarray(gradient_fn(prices), dtype=float)
-    objective = linear_objective_vector(gradient_at_prices)
-    result = linprog(
-        objective,
-        A_ub=system["A_ub"],
-        b_ub=system["b_ub"],
-        bounds=system["bounds"],
-        method="highs",
-    )
-    if result.status == 3:
-        return {"improvement": np.inf, "unbounded": True, "status": 3}
-    if result.status != 0:
-        return {"improvement": np.nan, "unbounded": False, "status": int(result.status)}
-    improvement = float(gradient_at_prices @ (np.asarray(result.x, dtype=float) - prices))
-    return {"improvement": improvement, "unbounded": False, "status": 0}
-
-
-def _empty_solve(status: str, message: str) -> dict:
-    return {
-        "status": status,
-        "message": message,
-        "prices": np.array([np.nan, np.nan]),
-        "revenue": np.nan,
-        "iterations": 0,
-        "objective_c": np.array([np.nan, np.nan]),
-        "linprog_status": {"infeasible": 2, "unbounded": 3}.get(status, 4),
-        "directional_improvement": np.nan,
-        "converged": False,
-    }
-
-
-def recession_rays(system: dict) -> list[np.ndarray]:
-    """Unit recession directions of ``A_ub x <= b_ub`` together with the price bounds.
-
-    A direction ``d`` is a recession direction when ``x + t d`` stays feasible for
-    every ``t >= 0``. In two dimensions those directions lie along the edges of
-    the recession cone, which are orthogonal to one binding normal and satisfy
-    the remaining homogeneous inequalities. A nonempty polytope has no nonzero
-    recession direction, so quadratic revenue on the default price box is bounded.
-    """
-    (r_lower, r_upper), (p_lower, p_upper) = system["bounds"]
-    normals = []
-    if system["A_ub"].size:
-        normals.extend(np.asarray(row, dtype=float) for row in system["A_ub"])
-    if r_upper is not None:
-        normals.append(np.array([1.0, 0.0]))
-    if r_lower is not None:
-        normals.append(np.array([-1.0, 0.0]))
-    if p_upper is not None:
-        normals.append(np.array([0.0, 1.0]))
-    if p_lower is not None:
-        normals.append(np.array([0.0, -1.0]))
-    if not normals:
-        return [
-            np.array([1.0, 0.0]),
-            np.array([-1.0, 0.0]),
-            np.array([0.0, 1.0]),
-            np.array([0.0, -1.0]),
-        ]
-    matrix = np.vstack(normals)
-    rays = []
-    for normal in normals:
-        tangent = np.array([-normal[1], normal[0]], dtype=float)
-        scale = float(np.linalg.norm(tangent))
-        if scale < 1e-12:
-            continue
-        for sign in (1.0, -1.0):
-            direction = sign * tangent / scale
-            if np.all(matrix @ direction <= 1e-7):
-                rays.append(direction)
-    return dedupe_points(rays)
-
-
-def is_revenue_unbounded(coef, system: dict) -> bool:
-    """True when quadratic revenue tends to infinity along some feasible ray.
-
-    Positive curvature along a recession direction is enough. Zero curvature
-    is unbounded when the slope along that ray is positive somewhere feasible.
-    Negative curvature dies out, so that ray does not make the programme unbounded.
-    """
-    if system["infeasible"]:
-        return False
-    rays = recession_rays(system)
-    if not rays:
-        return False
-    curvature_matrix = hessian(coef)
-    for direction in rays:
-        curvature = 0.5 * float(direction @ curvature_matrix @ direction)
-        if curvature > 1e-9:
-            return True
-        if curvature < -1e-9:
-            continue
-        slope_at_origin = float(gradient(np.zeros(2), coef) @ direction)
-        slope_gradient = curvature_matrix @ direction
-        if float(np.linalg.norm(slope_gradient)) <= 1e-8:
-            if slope_at_origin > 1e-8:
-                return True
-            continue
-        # Maximise the directional slope over the feasible set. An unbounded
-        # slope, or a positive maximum slope, means revenue grows without a
-        # finite upper bound along this ray.
-        slope_programme = linprog(
-            linear_objective_vector(slope_gradient),
-            A_ub=system["A_ub"],
-            b_ub=system["b_ub"],
-            bounds=system["bounds"],
-            method="highs",
-        )
-        if slope_programme.status == 3:
-            return True
-        if slope_programme.status == 0:
-            best_slope = slope_at_origin + float(slope_gradient @ slope_programme.x)
-            if best_slope > 1e-8:
+            if abs(np.linalg.det(np.vstack([matrix[i], matrix[j]]))) > 1e-8:
                 return True
     return False
 
 
-def feasible_start(system: dict):
-    """Any feasible point, from a Phase-I linear programme with a zero objective."""
-    if system["infeasible"]:
-        return None
+def solve_assignment(households: list[dict], assignment: dict[str, str], bounds: dict) -> dict:
+    """One linear programme: this product assignment, maximised with linprog."""
+    system = build_constraint_system(households, assignment, bounds)
+    coeff = objective_coefficients(households, assignment)
+    # linprog minimises. Negating the quantity vector maximises revenue.
     result = linprog(
-        np.zeros(2),
+        c=-coeff,
         A_ub=system["A_ub"],
         b_ub=system["b_ub"],
-        bounds=system["bounds"],
+        bounds=[(bounds["R_lower"], bounds["R_upper"]), (bounds["P_lower"], bounds["P_upper"])],
         method="highs",
     )
-    if result.status != 0:
-        return None
-    return np.asarray(result.x, dtype=float)
-
-
-def candidate_starts(system: dict, preferred) -> list[np.ndarray]:
-    starts = []
-    phase_one = feasible_start(system)
-    if phase_one is not None:
-        starts.append(phase_one)
-    vertices = polygon_vertices(system["A_ub"], system["b_ub"])
-    starts.extend(vertices)
-    if vertices:
-        centre = np.mean(np.vstack(vertices), axis=0)
-        starts.append(centre)
-    starts.extend(preferred)
-    return [point for point in dedupe_points(starts) if is_feasible(point, system["A_ub"], system["b_ub"])]
-
-
-def critical_point(coef):
-    """Unconstrained stationary point of quadratic revenue, if the Hessian is invertible."""
-    try:
-        point = np.linalg.solve(hessian(coef), np.array([-coef[0], -coef[3]], dtype=float))
-    except np.linalg.LinAlgError:
-        return None
-    if not np.all(np.isfinite(point)):
-        return None
-    return point
-
-
-def max_quadratic_on_segment(start, end, coef):
-    """Exact maximum of quadratic revenue on the segment from ``start`` to ``end``."""
-    start = np.asarray(start, dtype=float)
-    direction = np.asarray(end, dtype=float) - start
-    slope = float(gradient(start, coef) @ direction)
-    curvature = 0.5 * float(direction @ hessian(coef) @ direction)
-    candidates = [0.0, 1.0]
-    if curvature < -1e-12:
-        peak = -slope / (2.0 * curvature)
-        if 0.0 <= peak <= 1.0:
-            candidates.append(float(peak))
-    best_t = max(candidates, key=lambda t: revenue(start + t * direction, coef))
-    point = start + best_t * direction
-    return point, float(revenue(point, coef))
-
-
-def exact_quadratic_optimum(coef, system: dict):
-    """Global maximum of quadratic revenue on the LP feasible polygon.
-
-    Used only as a check on the successive linear programme. With two prices
-    the maximum is either the interior critical point, when revenue is concave
-    there and the point is feasible, or the best point on an edge. Each edge
-    is a univariate quadratic, maximised in closed form.
-    """
-    if system["infeasible"]:
-        return None
-    vertices = polygon_vertices(system["A_ub"], system["b_ub"])
-    if not vertices:
-        return None
-    candidates = list(vertices)
-    A_ub, b_ub = system["A_ub"], system["b_ub"]
-    for index in range(len(b_ub)):
-        tight = [vertex for vertex in vertices if abs(float(A_ub[index] @ vertex) - b_ub[index]) <= 1e-5]
-        if len(tight) < 2:
-            continue
-        tangent = np.array([-A_ub[index, 1], A_ub[index, 0]], dtype=float)
-        ordered = sorted(tight, key=lambda vertex: float(vertex @ tangent))
-        edge_point, _edge_revenue = max_quadratic_on_segment(ordered[0], ordered[-1], coef)
-        if is_feasible(edge_point, A_ub, b_ub, tol=1e-6):
-            candidates.append(edge_point)
-    interior = critical_point(coef)
-    if interior is not None and revenue_is_concave(coef) and is_feasible(interior, A_ub, b_ub, tol=1e-6):
-        candidates.append(interior)
-    best = max(candidates, key=lambda point: revenue(point, coef))
-    return {"R": float(best[0]), "P": float(best[1]), "revenue": float(revenue(best, coef))}
-
-
-def solve_revenue_lp(coef, price_bounds: dict, preferred_starts=None, quick: bool = False) -> dict:
-    """Solve one household (or any single linear-demand system) by successive LPs.
-
-    ``quick`` starts only from the preferred prices. The sensitivity re-solves
-    use it so each coefficient shock stays near the household optimum instead
-    of restarting from every vertex.
-    """
-    system = build_constraint_system(coef, price_bounds)
-    if system["infeasible"] or is_revenue_unbounded(coef, system):
-        status = "infeasible" if system["infeasible"] else "unbounded"
-        message = (
-            "Demand constraints cannot be satisfied."
-            if status == "infeasible"
-            else "Revenue increases without bound along a feasible price ray. A finite upper price guardrail is required."
+    label = ", ".join(f"{name} buys {product}" for name, product in assignment.items())
+    solved = {
+        "assignment": dict(assignment),
+        "assignment_label": label,
+        "c": coeff,
+        "A_ub": system["A_ub"],
+        "b_ub": system["b_ub"],
+        "constraint_names": system["names"],
+        "status": int(result.status),
+        "status_name": result.message,
+        "feasible": bool(result.success),
+    }
+    if not result.success:
+        solved.update(
+            {
+                "R": float("nan"),
+                "P": float("nan"),
+                "revenue": float("-inf"),
+                "vertex": False,
+                "tight": [],
+                "satisfied": False,
+            }
         )
-        solved = _empty_solve(status, message)
-        solved["system"] = system
-        solved["coef"] = coef
-        solved["quadratic"] = None
-        solved["revenue_gap"] = np.nan
         return solved
-    preferred = [] if preferred_starts is None else list(preferred_starts)
-    if quick and preferred:
-        starts = [point for point in dedupe_points(preferred) if is_feasible(point, system["A_ub"], system["b_ub"])]
-        if not starts:
-            starts = candidate_starts(system, preferred)
-    else:
-        starts = candidate_starts(system, preferred)
-    solved = successive_linear_programme(
-        revenue_fn=lambda prices: revenue(prices, coef),
-        gradient_fn=lambda prices: gradient(prices, coef),
-        system=system,
-        starts=starts,
+    point = np.asarray(result.x, dtype=float)
+    revenue = float(coeff @ point)
+    tight_idx = _tight_constraints(system["A_ub"], system["b_ub"], point)
+    solved.update(
+        {
+            "R": float(point[0]),
+            "P": float(point[1]),
+            "revenue": revenue,
+            "vertex": _is_vertex(system["A_ub"], system["b_ub"], point),
+            "tight": [system["names"][i] for i in tight_idx],
+            "satisfied": bool(np.all(system["A_ub"] @ point <= system["b_ub"] + 1e-6)),
+            "vertices": _vertices_from_constraints(system["A_ub"], system["b_ub"]),
+            "flat_price": (
+                "Premium price is not in this objective, so revenue is unchanged along that edge; the solver returns a vertex."
+                if abs(coeff[1]) < 1e-12
+                else "Regular price is not in this objective, so revenue is unchanged along that edge; the solver returns a vertex."
+                if abs(coeff[0]) < 1e-12
+                else ""
+            ),
+        }
     )
-    solved["system"] = system
-    solved["coef"] = coef
-    solved["quadratic"] = exact_quadratic_optimum(coef, system) if solved["status"] != "infeasible" else None
-    if solved["quadratic"] is not None and np.isfinite(solved["revenue"]):
-        gap = float(solved["revenue"] - solved["quadratic"]["revenue"])
-        solved["revenue_gap"] = gap
-        if solved["status"] == "iteration_limit" and abs(gap) <= 1e-3:
-            solved["status"] = "optimal"
-            solved["converged"] = True
-            solved["message"] = (
-                "Successive linear programme matches the exact quadratic maximum on this polygon."
-            )
-    else:
-        solved["revenue_gap"] = np.nan
     return solved
 
 
-def solve_pooled_revenue_lp(coefs, price_bounds: dict, preferred_starts=None) -> dict:
-    """One price pair maximising the sum of household revenues.
+def enumerate_assignments(households: list[dict]) -> list[dict[str, str]]:
+    """Cartesian product of each household's feasible products."""
+    menus: list[dict[str, str]] = [{}]
+    for household in households:
+        extended = []
+        for product in product_choices(household):
+            for menu in menus:
+                nxt = dict(menu)
+                nxt[household["label"]] = product
+                extended.append(nxt)
+        menus = extended
+    return menus
 
-    Demand constraints are stacked, one pair per household, because every
-    household must still be on the non-negative side of its own demand
-    boundary. The objective gradient is the sum of the household gradients,
-    since total revenue is the sum of revenues. This is a comparison
-    aggregate. The owner asked for a separate programme per household, and
-    that remains the primary result.
-    """
-    summed = tuple(float(sum(coef[index] for coef in coefs)) for index in range(6))
-    # Stack each household's demand rows. The price box is added once, from the
-    # summed system, so the same R <= R_upper row is not copied three times.
-    pieces = []
-    rhs_values = []
-    names = []
-    dropped = []
-    infeasible = False
-    for household_index, coef in enumerate(coefs):
-        part = build_constraint_system(coef, price_bounds)
-        infeasible = infeasible or part["infeasible"]
-        for row, rhs, name in zip(part["A_ub"], part["b_ub"], part["names"]):
-            if name.startswith("Q_"):
-                pieces.append(row)
-                rhs_values.append(rhs)
-                names.append(f"household_{household_index + 1}:{name}")
-        dropped.extend(part["dropped"])
-    price_only = build_constraint_system(summed, price_bounds)
-    for row, rhs, name in zip(price_only["A_ub"], price_only["b_ub"], price_only["names"]):
-        if not name.startswith("Q_"):
-            pieces.append(row)
-            rhs_values.append(rhs)
-            names.append(name)
-    system = {
-        "A_ub": np.vstack(pieces) if pieces else np.zeros((0, 2)),
-        "b_ub": np.asarray(rhs_values, dtype=float),
-        "bounds": price_only["bounds"],
-        "names": names,
-        "dropped": dropped,
-        "infeasible": infeasible or price_only["infeasible"],
-        "price_bounds": price_bounds,
-    }
-    if system["infeasible"] or is_revenue_unbounded(summed, system):
-        status = "infeasible" if system["infeasible"] else "unbounded"
-        message = (
-            "Demand constraints cannot be satisfied for every household at the same prices."
-            if status == "infeasible"
-            else "Total revenue increases without bound along a feasible price ray. A finite upper price guardrail is required."
-        )
-        solved = _empty_solve(status, message)
-        solved["system"] = system
-        solved["coef"] = summed
-        solved["quadratic"] = None
-        solved["revenue_gap"] = np.nan
-        return solved
-    preferred = [] if preferred_starts is None else list(preferred_starts)
-    starts = candidate_starts(system, preferred)
 
-    def total_revenue(prices):
-        return float(sum(revenue(prices, coef) for coef in coefs))
+def best_programme(households: list[dict], bounds: dict, assignments: list[dict[str, str]] | None = None) -> dict:
+    """Solve every assignment and keep the highest feasible revenue."""
+    if assignments is None:
+        assignments = enumerate_assignments(households)
+    solved = [solve_assignment(households, menu, bounds) for menu in assignments]
+    feasible = [item for item in solved if item["feasible"] and np.isfinite(item["revenue"])]
+    if not feasible:
+        return {"best": None, "cases": solved}
+    best = max(feasible, key=lambda item: item["revenue"])
+    return {"best": best, "cases": solved}
 
-    def total_gradient(prices):
-        total = np.zeros(2)
-        for coef in coefs:
-            total = total + gradient(prices, coef)
-        return total
 
-    solved = successive_linear_programme(total_revenue, total_gradient, system, starts)
-    solved["system"] = system
-    solved["coef"] = summed
-    # Exact check uses the summed quadratic on the stacked polygon.
-    solved["quadratic"] = exact_quadratic_optimum(summed, system) if solved["status"] != "infeasible" else None
-    if solved["quadratic"] is not None and np.isfinite(solved["revenue"]):
-        solved["revenue_gap"] = float(solved["revenue"] - solved["quadratic"]["revenue"])
+def predict_product(household: dict, regular: float, premium: float) -> str:
+    """Product implied by which side of the fitted lines the price sits on."""
+    kinds = {line["kind"]: line for line in household["lines"]}
+    if "stop" in kinds and _score(kinds["stop"], regular, premium) < 0.5 - 1e-9:
+        return "None"
+    if "switch" in kinds:
+        return "Premium" if _score(kinds["switch"], regular, premium) >= 0.5 - 1e-9 else "Regular"
+    return household.get("only_product") or "Premium"
+
+
+def revenue_of(household: dict, regular: float, premium: float) -> dict:
+    product = predict_product(household, regular, premium)
+    if product == "Regular":
+        revenue = household["d_regular"] * regular
+    elif product == "Premium":
+        revenue = household["d_premium"] * premium
     else:
-        solved["revenue_gap"] = np.nan
-    return solved
+        revenue = 0.0
+    return {"product": product, "revenue": float(revenue)}
 
 
-def _binding_flags(prices, coef, price_bounds) -> dict:
-    if not np.all(np.isfinite(prices)):
-        return {
-            "R_bound_active": "",
-            "P_bound_active": "",
-            "Q_regular_binding": False,
-            "Q_premium_binding": False,
+def _format_objective(coeff: np.ndarray) -> str:
+    parts = []
+    if abs(coeff[0]) > 1e-12:
+        parts.append(f"{coeff[0]:.4f} R")
+    if abs(coeff[1]) > 1e-12:
+        parts.append(f"{coeff[1]:.4f} P")
+    if not parts:
+        return "max  0"
+    return "max  " + " + ".join(parts)
+
+
+def format_programme(solved: dict, households: list[dict] | None = None) -> str:
+    """Objective and every constraint, with the fitted numbers filled in."""
+    lines = [
+        "Decision variables: R (Regular price), P (Premium price).",
+        _format_objective(solved["c"]),
+        "subject to",
+    ]
+    for name in solved["constraint_names"]:
+        lines.append(f"  {name}")
+    if households is not None:
+        lines.append("assignment")
+        for label, product in solved["assignment"].items():
+            match = next(item for item in households if item["label"] == label)
+            quantity = {"Regular": match["d_regular"], "Premium": match["d_premium"], "None": 0.0}[product]
+            lines.append(f"  {label} buys {product} (d = {quantity:.4f})")
+    if solved["feasible"]:
+        lines.append(
+            f"optimum  R = {solved['R']:.4f}, P = {solved['P']:.4f}, revenue = {solved['revenue']:.4f}"
+        )
+        lines.append("binding constraints")
+        for name in solved["tight"]:
+            lines.append(f"  {name}")
+    else:
+        lines.append("infeasible")
+    return "\n".join(lines)
+
+
+def household_equations(household: dict) -> list[str]:
+    """One readable equation per fitted line, plus the fixed quantities."""
+    text = []
+    for line in household["lines"]:
+        if line["kind"] == "switch":
+            role = "switches between Regular and Premium on"
+        else:
+            role = "stops buying above"
+        text.append(f"{role} {line['equation']}")
+    text.append(
+        f"d_regular = {household['d_regular']:.4f} (n = {household['n_regular']}), "
+        f"d_premium = {household['d_premium']:.4f} (n = {household['n_premium']})"
+    )
+    return text
+
+
+def optimise_prices_detailed(csv_path: str = "coffee_capsules_data.csv") -> dict:
+    """Shared menu plus one programme per household, and every assignment tried."""
+    problem = load_problem(csv_path)
+    households = problem["households"]
+    bounds = problem["bounds"]
+    shared = best_programme(households, bounds)
+    per_household = []
+    for household in households:
+        solo = best_programme([household], bounds)
+        per_household.append({"household": household, "programme": solo})
+    return {
+        "households": households,
+        "bounds": bounds,
+        "frame": problem["frame"],
+        "shared": shared,
+        "per_household": per_household,
+        "formulation": format_programme(shared["best"], households) if shared["best"] else "No feasible shared programme.",
+    }
+
+
+def _shock_households(households: list[dict], label: str, field: str, factor: float) -> list[dict]:
+    shocked = []
+    for household in households:
+        clone = {
+            **household,
+            "lines": [dict(line) for line in household["lines"]],
         }
-    regular_price, premium_price = prices
-    q_regular, q_premium = quantities(prices, coef)
-    r_bound = ""
-    p_bound = ""
-    if regular_price <= price_bounds["R_lower"] + 1e-4:
-        r_bound = "lower"
-    elif regular_price >= price_bounds["R_upper"] - 1e-4:
-        r_bound = "upper"
-    if premium_price <= price_bounds["P_lower"] + 1e-4:
-        p_bound = "lower"
-    elif premium_price >= price_bounds["P_upper"] - 1e-4:
-        p_bound = "upper"
-    return {
-        "R_bound_active": r_bound,
-        "P_bound_active": p_bound,
-        "Q_regular_binding": bool(abs(q_regular) <= 1e-4),
-        "Q_premium_binding": bool(abs(q_premium) <= 1e-4),
-    }
+        if clone["label"] == label:
+            for line in clone["lines"]:
+                line[field] = line[field] * factor
+                line["equation"] = line_equation(line)
+        shocked.append(clone)
+    return shocked
 
 
-def _notes(model: dict, solved: dict, price_bounds: dict) -> str:
-    if solved["status"] == "infeasible":
-        return solved["message"]
-    if solved["status"] == "unbounded":
-        return solved["message"]
-    prices = solved["prices"]
-    notes = []
-    if not revenue_is_concave(model["coef"]):
-        notes.append(
-            "Quadratic revenue is not concave for this household, so the successive LP is multi-started and checked against the exact edge maximum."
-        )
-    flags = _binding_flags(prices, model["coef"], price_bounds)
-    if flags["R_bound_active"] == "upper":
-        notes.append("Regular price is on the upper guardrail, which is there to stop the price going to infinity.")
-    if flags["P_bound_active"] == "upper":
-        notes.append("Premium price is on the upper guardrail.")
-    if flags["R_bound_active"] == "lower" or flags["P_bound_active"] == "lower":
-        notes.append("A price is on its lower bound of zero.")
-    if flags["Q_regular_binding"]:
-        notes.append("Predicted Regular demand is zero, so the household is at the point of stopping Regular purchases.")
-    if flags["Q_premium_binding"]:
-        notes.append("Predicted Premium demand is zero, so the household is at the point of stopping Premium purchases.")
-    outside = (
-        prices[0] > price_bounds["R_observed_max"] + 1e-6
-        or prices[0] < price_bounds["R_observed_min"] - 1e-6
-        or prices[1] > price_bounds["P_observed_max"] + 1e-6
-        or prices[1] < price_bounds["P_observed_min"] - 1e-6
-    )
-    if outside:
-        notes.append(
-            "The optimum lies outside the observed experimental price range, so it extrapolates the linear OLS fit."
-        )
-    if model["regular_always_zero"]:
-        notes.append(
-            "Regular quantity is identically zero in the sample, so the Regular OLS coefficients are zero. Regular revenue is zero; Regular price only matters through the cross effect on Premium demand."
-        )
-    if model["premium_always_zero"]:
-        notes.append("Premium quantity is identically zero in the sample.")
-    if solved["status"] == "iteration_limit":
-        notes.append(solved["message"])
-    return " ".join(notes)
-
-
-def _result_row(label: str, model: dict, solved: dict, price_bounds: dict, mean_prices) -> dict:
-    a_R, b_RR, b_RP, a_P, b_PR, b_PP = model["coef"]
-    prices = np.asarray(solved["prices"], dtype=float)
-    q_regular, q_premium = (np.nan, np.nan)
-    revenue_regular = np.nan
-    revenue_premium = np.nan
-    if np.all(np.isfinite(prices)):
-        q_regular, q_premium = quantities(prices, model["coef"])
-        revenue_regular = float(prices[0] * q_regular)
-        revenue_premium = float(prices[1] * q_premium)
-    baseline_q_regular, baseline_q_premium = quantities(mean_prices, model["coef"])
-    flags = _binding_flags(prices, model["coef"], price_bounds)
-    quadratic = solved.get("quadratic") or {}
-    objective_c = np.asarray(solved["objective_c"], dtype=float)
-    return {
-        "Household": label,
-        "R_opt": float(prices[0]),
-        "P_opt": float(prices[1]),
-        "max_revenue": float(solved["revenue"]) if np.isfinite(solved["revenue"]) else np.nan,
-        "revenue_regular": revenue_regular,
-        "revenue_premium": revenue_premium,
-        "Q_regular": q_regular,
-        "Q_premium": q_premium,
-        "status": solved["status"],
-        "converged": bool(solved["converged"]),
-        "iterations": int(solved["iterations"]),
-        "linprog_status": int(solved["linprog_status"]) if solved["linprog_status"] is not None else np.nan,
-        "objective_c_R": float(objective_c[0]) if np.all(np.isfinite(objective_c)) else np.nan,
-        "objective_c_P": float(objective_c[1]) if np.all(np.isfinite(objective_c)) else np.nan,
-        "directional_improvement": float(solved["directional_improvement"])
-        if np.isfinite(solved["directional_improvement"])
-        else np.nan,
-        "revenue_concave": revenue_is_concave(model["coef"]),
-        "quadratic_R": quadratic.get("R", np.nan),
-        "quadratic_P": quadratic.get("P", np.nan),
-        "quadratic_revenue": quadratic.get("revenue", np.nan),
-        "revenue_gap": solved.get("revenue_gap", np.nan),
-        "baseline_revenue": float(revenue(mean_prices, model["coef"])),
-        "baseline_Q_regular": baseline_q_regular,
-        "baseline_Q_premium": baseline_q_premium,
-        "mean_price_feasible": is_feasible(
-            mean_prices, solved["system"]["A_ub"], solved["system"]["b_ub"]
-        )
-        if solved.get("system") is not None
-        else False,
-        "a_R": a_R,
-        "b_RR": b_RR,
-        "b_RP": b_RP,
-        "a_P": a_P,
-        "b_PR": b_PR,
-        "b_PP": b_PP,
-        "r_squared_regular": model["r_squared_regular"],
-        "r_squared_premium": model["r_squared_premium"],
-        "ols_rank_regular": model["rank_regular"],
-        "ols_rank_premium": model["rank_premium"],
-        "n_obs": model["n"],
-        "regular_always_zero": model["regular_always_zero"],
-        "premium_always_zero": model["premium_always_zero"],
-        **price_bounds,
-        **flags,
-        "constraint_names": ";".join(solved["system"]["names"]) if solved.get("system") else "",
-        "notes": _notes(model, solved, price_bounds),
-        "solver": "scipy.optimize.linprog/highs",
-        "linearisation": "successive_first_order_taylor_trust_region",
-    }
-
-
-def optimise_prices_detailed(
-    csv_path=None,
-    sd_multipliers=UPPER_SD_MULTIPLIERS,
-    default_multiplier: float = DEFAULT_UPPER_SD_MULTIPLIER,
-) -> dict:
-    """Fit per-household OLS demand and solve a revenue LP for every household.
-
-    Returns DataFrames that downstream sensitivity checks and plots can reuse
-    without refitting: coefficients, bounds, optimal prices, demands, true
-    quadratic revenue, solver status, and the exact quadratic comparison.
-    """
-    frame = pd.read_csv(resolve_data_path(csv_path))
-    regular_price, premium_price = load_prices(frame)
-    mean_prices = np.array([float(np.mean(regular_price)), float(np.mean(premium_price))])
-    models = []
-    for label, regular_column, premium_column in discover_households(frame):
-        fitted = fit_household(
-            frame[regular_column].to_numpy(dtype=float),
-            frame[premium_column].to_numpy(dtype=float),
-            regular_price,
-            premium_price,
-        )
-        fitted["label"] = label
-        models.append(fitted)
-
-    sensitivity_rows = []
-    common_rows = []
-    for multiplier in sd_multipliers:
-        bounds = price_bounds_from_sample(regular_price, premium_price, multiplier)
-        preferred = [mean_prices]
-        for model in models:
-            solved = solve_revenue_lp(model["coef"], bounds, preferred_starts=preferred)
-            sensitivity_rows.append(_result_row(model["label"], model, solved, bounds, mean_prices))
-        pooled = solve_pooled_revenue_lp([model["coef"] for model in models], bounds, preferred_starts=preferred)
-        # The pooled objective uses summed coefficients; R^2 is not defined for that sum.
-        pooled_model = {
-            "coef": pooled["coef"],
-            "r_squared_regular": np.nan,
-            "r_squared_premium": np.nan,
-            "rank_regular": np.nan,
-            "rank_premium": np.nan,
-            "n": models[0]["n"],
-            "regular_always_zero": False,
-            "premium_always_zero": False,
-        }
-        common_rows.append(
-            _result_row("All households (one price menu)", pooled_model, pooled, bounds, mean_prices)
-        )
-
-    sensitivity = pd.DataFrame(sensitivity_rows)
-    common = pd.DataFrame(common_rows)
-    results = sensitivity.loc[
-        np.isclose(sensitivity["upper_sd_multiplier"], default_multiplier)
-    ].reset_index(drop=True)
-    common_default = common.loc[np.isclose(common["upper_sd_multiplier"], default_multiplier)].reset_index(drop=True)
-    finite_revenue = results["max_revenue"].to_numpy(dtype=float)
-    total = float(np.nansum(finite_revenue))
-    return {
-        "results": results,
-        "sensitivity": sensitivity,
-        "common_price": common_default,
-        "common_price_sensitivity": common,
-        "total_separate_revenue": total,
-        "mean_prices": mean_prices,
-        "formulation": FORMULATION_SUMMARY,
-        "n_households": int(len(results)),
-    }
-
-
-def assess_price_scenario(result_row, regular_price: float, premium_price: float) -> dict:
-    """OLS demand and revenue at a caller-chosen price, using that household's row."""
-    coef = coef_from_mapping(result_row)
-    q_regular, q_premium = quantities((regular_price, premium_price), coef)
-    inside_box = (
-        result_row["R_lower"] - 1e-8 <= regular_price <= result_row["R_upper"] + 1e-8
-        and result_row["P_lower"] - 1e-8 <= premium_price <= result_row["P_upper"] + 1e-8
-    )
-    demand_ok = q_regular >= -1e-8 and q_premium >= -1e-8
-    algebraic = float(regular_price * q_regular + premium_price * q_premium)
-    return {
-        "Q_regular": q_regular,
-        "Q_premium": q_premium,
-        "revenue": algebraic if demand_ok else np.nan,
-        "algebraic_revenue": algebraic,
-        "feasible": bool(inside_box and demand_ok),
-        "inside_price_box": bool(inside_box),
-        "demand_nonnegative": bool(demand_ok),
-    }
-
-
-def _zero_demand_segment(intercept, slope_regular, slope_premium, price_bounds, samples: int = 200):
-    r_lower, r_upper = price_bounds["R_lower"], price_bounds["R_upper"]
-    p_lower, p_upper = price_bounds["P_lower"], price_bounds["P_upper"]
-    if abs(slope_premium) >= 1e-10:
-        regular_grid = np.linspace(r_lower, r_upper, samples)
-        premium_grid = -(intercept + slope_regular * regular_grid) / slope_premium
-        mask = (premium_grid >= p_lower) & (premium_grid <= p_upper)
-        return regular_grid[mask], premium_grid[mask]
-    if abs(slope_regular) < 1e-10:
-        return np.array([]), np.array([])
-    regular_root = -intercept / slope_regular
-    if r_lower <= regular_root <= r_upper:
-        return np.array([regular_root, regular_root]), np.array([p_lower, p_upper])
-    return np.array([]), np.array([])
-
-
-def _ordered_polygon(vertices: list[np.ndarray]) -> tuple[list[float], list[float]]:
-    centre = np.mean(np.vstack(vertices), axis=0)
-    ordered = sorted(vertices, key=lambda point: np.arctan2(point[1] - centre[1], point[0] - centre[0]))
-    regular = [float(point[0]) for point in ordered] + [float(ordered[0][0])]
-    premium = [float(point[1]) for point in ordered] + [float(ordered[0][1])]
-    return regular, premium
-
-
-def feasible_region_figure(
-    result_row,
-    observed_prices,
-    scenario_regular=None,
-    scenario_premium=None,
-    height: int = 520,
-):
-    """Price-plane figure for one household.
-
-    Draws the LP feasible set as a shaded polygon, the demand-boundary
-    constraint lines, and a labelled marker at that household's optimal
-    prices. ``observed_prices`` needs columns ``P_Regular`` and ``P_Premium``.
-    """
-    coef = coef_from_mapping(result_row)
-    price_bounds = {
-        "R_lower": float(result_row["R_lower"]),
-        "R_upper": float(result_row["R_upper"]),
-        "P_lower": float(result_row["P_lower"]),
-        "P_upper": float(result_row["P_upper"]),
-    }
-    system = build_constraint_system(coef, {**price_bounds, **{
-        key: float(result_row[key])
-        for key in (
-            "R_observed_min",
-            "R_observed_max",
-            "P_observed_min",
-            "P_observed_max",
-            "R_observed_mean",
-            "P_observed_mean",
-            "upper_sd_multiplier",
-        )
-        if key in result_row.index
-    }})
-    # ``build_constraint_system`` only reads the four price limits plus the
-    # keys it stores through. Supply the observed keys when present; the
-    # builder itself only needs the four limits, so fill anything missing.
-    for key, value in price_bounds.items():
-        system["price_bounds"].setdefault(key, value)
-
-    r_lower, r_upper = price_bounds["R_lower"], price_bounds["R_upper"]
-    p_lower, p_upper = price_bounds["P_lower"], price_bounds["P_upper"]
-    regular_axis = np.linspace(r_lower, r_upper, 90)
-    premium_axis = np.linspace(p_lower, p_upper, 90)
-    regular_grid, premium_grid = np.meshgrid(regular_axis, premium_axis)
-    q_regular = coef[0] + coef[1] * regular_grid + coef[2] * premium_grid
-    q_premium = coef[3] + coef[4] * regular_grid + coef[5] * premium_grid
-    revenue_grid = regular_grid * q_regular + premium_grid * q_premium
-    revenue_grid = np.where((q_regular >= -1e-8) & (q_premium >= -1e-8), revenue_grid, np.nan)
-
-    figure = go.Figure()
-    if np.isfinite(revenue_grid).any():
-        figure.add_trace(
-            go.Contour(
-                x=regular_axis,
-                y=premium_axis,
-                z=revenue_grid,
-                colorscale="YlOrRd",
-                contours={"coloring": "fill", "showlines": False},
-                colorbar={"title": "Revenue (€)", "thickness": 12},
-                hovertemplate="Regular €%{x:.1f}<br>Premium €%{y:.1f}<br>Revenue €%{z:.1f}<extra></extra>",
-                name="Revenue",
-            )
-        )
-    vertices = polygon_vertices(system["A_ub"], system["b_ub"])
-    if len(vertices) >= 3:
-        polygon_r, polygon_p = _ordered_polygon(vertices)
-        figure.add_trace(
-            go.Scatter(
-                x=polygon_r,
-                y=polygon_p,
-                mode="lines",
-                name="Feasible region",
-                fill="toself",
-                fillcolor="rgba(22,119,255,0.22)",
-                line={"color": "#172033", "width": 2},
-                hoverinfo="skip",
-            )
-        )
-    regular_line_r, regular_line_p = _zero_demand_segment(coef[0], coef[1], coef[2], price_bounds)
-    premium_line_r, premium_line_p = _zero_demand_segment(coef[3], coef[4], coef[5], price_bounds)
-    if len(regular_line_r):
-        figure.add_trace(
-            go.Scatter(
-                x=regular_line_r,
-                y=regular_line_p,
-                mode="lines",
-                name="Regular demand = 0",
-                line={"color": "#1677ff", "width": 2, "dash": "dash"},
-            )
-        )
-    if len(premium_line_r):
-        figure.add_trace(
-            go.Scatter(
-                x=premium_line_r,
-                y=premium_line_p,
-                mode="lines",
-                name="Premium demand = 0",
-                line={"color": "#ff8a1f", "width": 2, "dash": "dash"},
-            )
-        )
-    # Price bounds are linear constraints too: non-negativity and the upper guardrail.
-    r_lo, r_hi = price_bounds["R_lower"], price_bounds["R_upper"]
-    p_lo, p_hi = price_bounds["P_lower"], price_bounds["P_upper"]
-    for name, xs, ys in (
-        ("R ≥ 0" if abs(r_lo) < 1e-9 else f"R ≥ {r_lo:.2f}", [r_lo, r_lo], [p_lo, p_hi]),
-        (f"R ≤ {r_hi:.2f}", [r_hi, r_hi], [p_lo, p_hi]),
-        ("P ≥ 0" if abs(p_lo) < 1e-9 else f"P ≥ {p_lo:.2f}", [r_lo, r_hi], [p_lo, p_lo]),
-        (f"P ≤ {p_hi:.2f}", [r_lo, r_hi], [p_hi, p_hi]),
-    ):
-        figure.add_trace(
-            go.Scatter(
-                x=xs,
-                y=ys,
-                mode="lines",
-                name=name,
-                line={"color": "#98a2b3", "width": 1.5, "dash": "dot"},
-                hovertemplate=f"{name}<extra></extra>",
-            )
-        )
-    observed = observed_prices[["P_Regular", "P_Premium"]].drop_duplicates()
-    figure.add_trace(
-        go.Scatter(
-            x=observed["P_Regular"],
-            y=observed["P_Premium"],
-            mode="markers",
-            name="Observed weeks",
-            marker={"size": 9, "color": "#667085", "line": {"color": "white", "width": 1}},
-            hovertemplate="Observed<br>Regular €%{x:.0f}<br>Premium €%{y:.0f}<extra></extra>",
-        )
-    )
-    if scenario_regular is not None and scenario_premium is not None:
-        figure.add_trace(
-            go.Scatter(
-                x=[scenario_regular],
-                y=[scenario_premium],
-                mode="markers",
-                name="Scenario",
-                marker={"symbol": "diamond", "size": 14, "color": "#1677ff", "line": {"color": "white", "width": 1}},
-                hovertemplate="Scenario<br>Regular €%{x:.1f}<br>Premium €%{y:.1f}<extra></extra>",
-            )
-        )
-    household = result_row["Household"] if "Household" in result_row.index else "Household"
-    if np.isfinite(result_row["R_opt"]) and np.isfinite(result_row["P_opt"]):
-        optimum_r = float(result_row["R_opt"])
-        optimum_p = float(result_row["P_opt"])
-        optimum_label = (
-            f"Optimal: P={optimum_p:.2f}, R={optimum_r:.2f}, Rev={float(result_row['max_revenue']):.2f}"
-        )
-        figure.add_trace(
-            go.Scatter(
-                x=[optimum_r],
-                y=[optimum_p],
-                mode="markers",
-                name="LP optimum",
-                marker={"symbol": "star", "size": 18, "color": "#172033", "line": {"color": "white", "width": 1}},
-                hovertemplate=f"{optimum_label}<extra></extra>",
-            )
-        )
-        label_below = optimum_p > p_lower + 0.62 * (p_upper - p_lower)
-        figure.add_annotation(
-            x=optimum_r,
-            y=optimum_p,
-            text=optimum_label,
-            showarrow=True,
-            arrowhead=2,
-            arrowcolor="#172033",
-            ax=46,
-            ay=42 if label_below else -46,
-            bgcolor="white",
-            bordercolor="#172033",
-            borderwidth=1,
-            font={"size": 11, "color": "#172033"},
-        )
-    pad_r = 0.06 * (r_upper - r_lower)
-    pad_p = 0.06 * (p_upper - p_lower)
-    figure.update_layout(
-        height=height,
-        margin={"l": 10, "r": 10, "t": 36, "b": 10},
-        title={"text": f"{household}: OLS feasible prices and revenue", "font": {"size": 14}},
-        paper_bgcolor="white",
-        plot_bgcolor="white",
-        font={"family": "Inter, Arial, sans-serif", "color": "#172033"},
-        xaxis={
-            "title": "Regular price R (€)",
-            "range": [r_lower - pad_r, r_upper + pad_r],
-            "gridcolor": "#e8edf3",
-            "zeroline": False,
-        },
-        yaxis={
-            "title": "Premium price P (€)",
-            "range": [p_lower - pad_p, p_upper + pad_p],
-            "gridcolor": "#e8edf3",
-            "zeroline": False,
-        },
-        legend={"orientation": "h", "y": 1.12, "x": 0},
-        hoverlabel={"bgcolor": "white"},
-    )
-    return figure
-
-
-def sensitivity_figure(sensitivity: pd.DataFrame):
-    """Optimal Regular price against the upper-guardrail rule, by household.
-
-    Households whose quadratic revenue is not concave ride the Regular-price
-    cap. This figure is the check that makes that visible.
-    """
-    figure = go.Figure()
-    for household, group in sensitivity.groupby("Household", sort=False):
-        ordered = group.sort_values("upper_sd_multiplier")
-        figure.add_trace(
-            go.Scatter(
-                x=ordered["R_upper"],
-                y=ordered["R_opt"],
-                mode="lines+markers",
-                name=str(household),
-                hovertemplate=(
-                    f"{household}<br>Regular cap €%{{x:.1f}}<br>Optimal Regular €%{{y:.1f}}"
-                    "<br>Premium €%{customdata[0]:.1f}<br>Revenue €%{customdata[1]:.1f}<extra></extra>"
-                ),
-                customdata=np.column_stack([ordered["P_opt"], ordered["max_revenue"]]),
-            )
-        )
-    figure.add_trace(
-        go.Scatter(
-            x=sensitivity["R_upper"],
-            y=sensitivity["R_upper"],
-            mode="lines",
-            name="Regular price cap",
-            line={"color": "#98a2b3", "dash": "dot"},
-            hoverinfo="skip",
-        )
-    )
-    figure.update_layout(
-        height=420,
-        margin={"l": 10, "r": 10, "t": 36, "b": 10},
-        title={"text": "How the Regular-price guardrail moves the LP solution", "font": {"size": 14}},
-        paper_bgcolor="white",
-        plot_bgcolor="white",
-        font={"family": "Inter, Arial, sans-serif", "color": "#172033"},
-        xaxis={"title": "Upper bound on Regular price (€)", "gridcolor": "#e8edf3", "zeroline": False},
-        yaxis={"title": "Optimal Regular price (€)", "gridcolor": "#e8edf3", "zeroline": False},
-        legend={"orientation": "h", "y": 1.12, "x": 0},
-        hoverlabel={"bgcolor": "white"},
-    )
-    return figure
-
-
-def _bounds_from_result_row(row) -> dict:
-    keys = (
-        "R_lower",
-        "R_upper",
-        "P_lower",
-        "P_upper",
-        "R_observed_min",
-        "R_observed_max",
-        "P_observed_min",
-        "P_observed_max",
-        "R_observed_mean",
-        "P_observed_mean",
-        "upper_sd_multiplier",
-    )
-    return {key: float(row[key]) for key in keys}
-
-
-def structural_sensitivity(results: pd.DataFrame, pct: float = 0.10) -> pd.DataFrame:
-    """Re-solve the household LP after shocking each OLS coefficient by ±pct.
-
-    Price rows are not re-solves. They move the LP optimum's R or P by ±pct,
-    hold the other price, and recompute revenue. That is the local price test
-    around the optimum the programme actually returned.
-    """
+def structural_sensitivity(detail: dict, pct: float = 0.10) -> pd.DataFrame:
+    """Re-solve after shocking each fitted line coefficient, and after moving prices."""
     rows = []
-    for _, household in results.iterrows():
-        if household["status"] != "optimal" or not np.isfinite(household["R_opt"]):
-            continue
-        base_coef = coef_from_mapping(household)
-        bounds = _bounds_from_result_row(household)
-        base_prices = np.array([float(household["R_opt"]), float(household["P_opt"])], dtype=float)
-        base_revenue = float(household["max_revenue"])
-        for index, name in enumerate(COEF_NAMES):
-            for sign in (1.0, -1.0):
-                shocked = list(base_coef)
-                shocked[index] = base_coef[index] * (1.0 + sign * pct)
-                solved = solve_revenue_lp(tuple(shocked), bounds, preferred_starts=[base_prices], quick=True)
-                solved_r = float(solved["prices"][0])
-                solved_p = float(solved["prices"][1])
-                solved_revenue = float(solved["revenue"]) if np.isfinite(solved["revenue"]) else np.nan
+    base = detail["shared"]["best"]
+    bounds = detail["bounds"]
+    fields = (("intercept", "intercept"), ("b_R", "slope on R"), ("b_P", "slope on P"))
+    for household in detail["households"]:
+        for field, pretty in fields:
+            for sign, factor in (("+", 1.0 + pct), ("−", 1.0 - pct)):
+                shocked = _shock_households(detail["households"], household["label"], field, factor)
+                solved = best_programme(shocked, bounds)
+                best = solved["best"]
+                revenue = best["revenue"] if best else float("nan")
                 rows.append(
                     {
-                        "Household": household["Household"],
-                        "kind": "coefficient",
-                        "parameter": name,
-                        "shock": sign * pct,
-                        "R_opt": solved_r,
-                        "P_opt": solved_p,
-                        "max_revenue": solved_revenue,
-                        "delta_R": solved_r - base_prices[0],
-                        "delta_P": solved_p - base_prices[1],
-                        "delta_revenue": solved_revenue - base_revenue if np.isfinite(solved_revenue) else np.nan,
-                        "status": solved["status"],
+                        "Household": household["label"],
+                        "kind": "line coefficient",
+                        "parameter": pretty,
+                        "shock": f"{sign}{pct:.0%}",
+                        "R_opt": best["R"] if best else float("nan"),
+                        "P_opt": best["P"] if best else float("nan"),
+                        "max_revenue": revenue,
+                        "delta_revenue": revenue - base["revenue"] if best else float("nan"),
+                        "assignment": best["assignment_label"] if best else "infeasible",
+                        "status": "optimal" if best else "infeasible",
                     }
                 )
+        own = next(item["programme"]["best"] for item in detail["per_household"] if item["household"]["label"] == household["label"])
         for price_name, index in (("R", 0), ("P", 1)):
-            for sign in (1.0, -1.0):
-                prices = base_prices.copy()
-                prices[index] = base_prices[index] * (1.0 + sign * pct)
-                assessed = assess_price_scenario(household, float(prices[0]), float(prices[1]))
-                earned = float(assessed["revenue"]) if assessed["feasible"] and np.isfinite(assessed["revenue"]) else np.nan
+            for sign, factor in (("+", 1.0 + pct), ("−", 1.0 - pct)):
+                point = [own["R"], own["P"]]
+                point[index] = point[index] * factor
+                assessed = revenue_of(household, point[0], point[1])
                 rows.append(
                     {
-                        "Household": household["Household"],
-                        "kind": "price",
+                        "Household": household["label"],
+                        "kind": "price move",
                         "parameter": price_name,
-                        "shock": sign * pct,
-                        "R_opt": float(prices[0]),
-                        "P_opt": float(prices[1]),
-                        "max_revenue": earned,
-                        "delta_R": float(prices[0] - base_prices[0]),
-                        "delta_P": float(prices[1] - base_prices[1]),
-                        "delta_revenue": earned - base_revenue if np.isfinite(earned) else np.nan,
-                        "status": "feasible" if assessed["feasible"] else "infeasible",
+                        "shock": f"{sign}{pct:.0%}",
+                        "R_opt": point[0],
+                        "P_opt": point[1],
+                        "max_revenue": assessed["revenue"],
+                        "delta_revenue": assessed["revenue"] - own["revenue"],
+                        "assignment": assessed["product"],
+                        "status": "evaluated",
                     }
                 )
     return pd.DataFrame(rows)
 
 
-def structural_sensitivity_figure(structural: pd.DataFrame):
-    """Revenue change when each OLS coefficient is raised by the sensitivity shock."""
-    figure = go.Figure()
-    positive = structural[(structural["kind"] == "coefficient") & (structural["shock"] > 0)]
-    for household, group in positive.groupby("Household", sort=False):
-        figure.add_trace(
-            go.Bar(
-                x=group["parameter"],
-                y=group["delta_revenue"],
-                name=str(household),
-                hovertemplate=f"{household}<br>%{{x}} +shock<br>Δ revenue €%{{y:.2f}}<extra></extra>",
-            )
-        )
-    figure.update_layout(
-        barmode="group",
-        height=420,
-        margin={"l": 10, "r": 10, "t": 36, "b": 10},
-        title={"text": "Revenue change after raising each OLS coefficient", "font": {"size": 14}},
-        paper_bgcolor="white",
-        plot_bgcolor="white",
-        font={"family": "Inter, Arial, sans-serif", "color": "#172033"},
-        xaxis={"title": "Shocked coefficient", "gridcolor": "#e8edf3"},
-        yaxis={"title": "Change in max revenue (€)", "gridcolor": "#e8edf3", "zeroline": True},
-        legend={"orientation": "h", "y": 1.12, "x": 0},
-        hoverlabel={"bgcolor": "white"},
-    )
-    return figure
-
-
-def regret_table(results: pd.DataFrame, menus: dict) -> pd.DataFrame:
-    """Revenue regret of charging every household each named price menu.
-
-    Regret is the household's own LP maximum minus the revenue earned at the
-    menu. A menu that drives predicted demand negative, or that leaves the
-    price guardrail, is not a feasible plan: no revenue is booked and regret
-    equals the whole optimum. Own-menu regret is zero when the LP solution
-    is feasible, which is the check that the optimum really is best inside
-    the constraint set.
-    """
+def bound_sensitivity(detail: dict) -> pd.DataFrame:
+    """Re-solve the shared programme with a looser and a tighter price box."""
     rows = []
-    for _, household in results.iterrows():
-        optimum = float(household["max_revenue"])
-        for menu_name, prices in menus.items():
-            regular_price, premium_price = prices
-            assessed = assess_price_scenario(household, float(regular_price), float(premium_price))
-            if assessed["feasible"] and np.isfinite(assessed["revenue"]):
-                earned = float(assessed["revenue"])
-                regret = optimum - earned
-            else:
-                earned = np.nan
-                regret = optimum
+    base_bounds = detail["bounds"]
+    variants = [
+        ("Observed maximum", 0.0),
+        ("Observed maximum + 1 SD", 1.0),
+        ("Observed maximum + 2 SD", 2.0),
+    ]
+    for name, extra in variants:
+        bounds = dict(base_bounds)
+        bounds["R_upper"] = base_bounds["R_upper"] + extra * base_bounds["R_sd"]
+        bounds["P_upper"] = base_bounds["P_upper"] + extra * base_bounds["P_sd"]
+        solved = best_programme(detail["households"], bounds)
+        best = solved["best"]
+        rows.append(
+            {
+                "Price box": name,
+                "R_upper": bounds["R_upper"],
+                "P_upper": bounds["P_upper"],
+                "R_opt": best["R"] if best else float("nan"),
+                "P_opt": best["P"] if best else float("nan"),
+                "max_revenue": best["revenue"] if best else float("nan"),
+                "assignment": best["assignment_label"] if best else "infeasible",
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def regret_table(detail: dict, scenario: tuple[float, float]) -> pd.DataFrame:
+    """Revenue and regret of the shared optimum, each household optimum, and the sliders."""
+    shared = detail["shared"]["best"]
+    menus = [("Shared LP optimum", shared["R"], shared["P"])]
+    for item in detail["per_household"]:
+        best = item["programme"]["best"]
+        menus.append((f"{item['household']['label']} LP optimum", best["R"], best["P"]))
+    menus.append(("Scenario sliders", float(scenario[0]), float(scenario[1])))
+    rows = []
+    for item in detail["per_household"]:
+        household = item["household"]
+        own = item["programme"]["best"]["revenue"]
+        for menu, regular, premium in menus:
+            assessed = revenue_of(household, regular, premium)
             rows.append(
                 {
-                    "Household": household["Household"],
-                    "Menu": menu_name,
-                    "R": float(regular_price),
-                    "P": float(premium_price),
-                    "revenue": earned,
-                    "feasible": bool(assessed["feasible"]),
-                    "Q_regular": assessed["Q_regular"],
-                    "Q_premium": assessed["Q_premium"],
-                    "regret": float(regret),
-                    "own_max_revenue": optimum,
+                    "Household": household["label"],
+                    "Menu": menu,
+                    "R": regular,
+                    "P": premium,
+                    "product": assessed["product"],
+                    "revenue": assessed["revenue"],
+                    "regret": own - assessed["revenue"],
                 }
             )
     return pd.DataFrame(rows)
 
 
-def lp_price_menus(results: pd.DataFrame, common_price: pd.DataFrame, scenario=None) -> dict:
-    """Menus the regret table compares: each household optimum, the shared menu, and an optional scenario."""
-    menus = {}
-    for _, row in results.iterrows():
-        menus[f"{row['Household']} LP optimum"] = (float(row["R_opt"]), float(row["P_opt"]))
-    common = common_price.iloc[0]
-    menus["Shared LP menu"] = (float(common["R_opt"]), float(common["P_opt"]))
-    if len(results):
-        menus["Experiment mean prices"] = (
-            float(results.iloc[0]["R_observed_mean"]),
-            float(results.iloc[0]["P_observed_mean"]),
+def _add_household_lines(fig: go.Figure, households: list[dict], bounds: dict, span: tuple[float, float]) -> None:
+    r_grid = np.linspace(span[0], span[1], 80)
+    for household in households:
+        for line in household["lines"]:
+            if abs(line["b_P"]) < 1e-12:
+                continue
+            slope = -line["b_R"] / line["b_P"]
+            icept = (0.5 - line["intercept"]) / line["b_P"]
+            p_grid = slope * r_grid + icept
+            fig.add_trace(
+                go.Scatter(
+                    x=r_grid,
+                    y=p_grid,
+                    mode="lines",
+                    name=f"{household['label']}: {line['equation']}",
+                    line=dict(
+                        color=LINE_COLOR.get(household["label"], "#172033"),
+                        dash=LINE_STYLE.get(household["label"], "solid"),
+                        width=2.5,
+                        shape="spline",
+                    ),
+                    hovertemplate="R=%{x:.2f}<br>P=%{y:.2f}<extra>" + household["label"] + "</extra>",
+                )
+            )
+
+
+def _shade(fig: go.Figure, solved: dict) -> None:
+    vertices = solved.get("vertices") or []
+    if len(vertices) < 3:
+        return
+    xs = [pt[0] for pt in vertices] + [vertices[0][0]]
+    ys = [pt[1] for pt in vertices] + [vertices[0][1]]
+    fig.add_trace(
+        go.Scatter(
+            x=xs,
+            y=ys,
+            fill="toself",
+            mode="lines",
+            name="Feasible region",
+            line=dict(color="rgba(22,119,255,0.35)", width=1),
+            fillcolor="rgba(22,119,255,0.16)",
+            hoverinfo="skip",
         )
-    if scenario is not None:
-        menus["Scenario sliders"] = (float(scenario[0]), float(scenario[1]))
-    return menus
+    )
 
 
-def regret_figure(regret: pd.DataFrame):
-    """Grouped bars of LP regret by price menu and household."""
-    figure = go.Figure()
-    for household, group in regret.groupby("Household", sort=False):
-        figure.add_trace(
-            go.Bar(
-                x=group["Menu"],
-                y=group["regret"],
-                name=str(household),
-                hovertemplate=f"{household}<br>%{{x}}<br>Regret €%{{y:.2f}}<extra></extra>",
+def _objective_level(fig: go.Figure, solved: dict, bounds: dict) -> None:
+    coeff = solved["c"]
+    if not solved["feasible"]:
+        return
+    revenue = solved["revenue"]
+    r0, r1 = bounds["R_lower"], bounds["R_upper"]
+    if abs(coeff[1]) > 1e-10:
+        p0 = (revenue - coeff[0] * r0) / coeff[1]
+        p1 = (revenue - coeff[0] * r1) / coeff[1]
+        fig.add_trace(
+            go.Scatter(
+                x=[r0, r1],
+                y=[p0, p1],
+                mode="lines",
+                name="Objective level",
+                line=dict(color="#0f9f6e", width=2, dash="dot"),
+                hovertemplate="Iso-revenue<extra></extra>",
             )
         )
-    figure.update_layout(
-        barmode="group",
-        height=420,
-        margin={"l": 10, "r": 10, "t": 36, "b": 10},
-        title={"text": "Regret against each household's own LP optimum", "font": {"size": 14}},
-        paper_bgcolor="white",
+    elif abs(coeff[0]) > 1e-10:
+        fig.add_vline(x=solved["R"], line=dict(color="#0f9f6e", width=2, dash="dot"))
+
+
+def _optimum_marker(fig: go.Figure, solved: dict, bounds: dict) -> None:
+    if not solved["feasible"]:
+        return
+    fig.add_trace(
+        go.Scatter(
+            x=[solved["R"]],
+            y=[solved["P"]],
+            mode="markers",
+            name="Optimum",
+            marker=dict(size=14, color="#172033", symbol="star", line=dict(color="white", width=1)),
+            hovertemplate=f"R=%{{x:.2f}}<br>P=%{{y:.2f}}<br>Revenue={solved['revenue']:.2f}<extra></extra>",
+        )
+    )
+    # Keep the label inside the axes when the star sits on the upper-right corner.
+    ax = -120 if solved["R"] > 0.55 * bounds["R_upper"] else 80
+    ay = 55 if solved["P"] > 0.72 * bounds["P_upper"] else -50
+    fig.add_annotation(
+        x=solved["R"],
+        y=solved["P"],
+        text=f"Optimal: P={solved['P']:.2f}, R={solved['R']:.2f}, Revenue={solved['revenue']:.2f}",
+        showarrow=True,
+        arrowhead=2,
+        ax=ax,
+        ay=ay,
+        bgcolor="white",
+        bordercolor="#172033",
+        borderwidth=1,
+        font=dict(size=12, color="#172033"),
+    )
+
+
+def _axis_layout(fig: go.Figure, title: str, bounds: dict) -> None:
+    pad_r = max(4.0, 0.08 * bounds["R_upper"])
+    pad_p = max(6.0, 0.08 * bounds["P_upper"])
+    fig.update_layout(
+        title=title,
+        xaxis_title="Regular price R",
+        yaxis_title="Premium price P",
+        xaxis=dict(range=[bounds["R_lower"] - pad_r, bounds["R_upper"] + pad_r], zeroline=False),
+        yaxis=dict(range=[bounds["P_lower"] - pad_p, bounds["P_upper"] + pad_p], zeroline=False),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0),
+        margin=dict(l=48, r=24, t=80, b=48),
         plot_bgcolor="white",
-        font={"family": "Inter, Arial, sans-serif", "color": "#172033"},
-        xaxis={"title": "Price menu", "gridcolor": "#e8edf3"},
-        yaxis={"title": "Regret (€)", "gridcolor": "#e8edf3", "zeroline": False},
-        legend={"orientation": "h", "y": 1.12, "x": 0},
-        hoverlabel={"bgcolor": "white"},
+        paper_bgcolor="white",
+        height=560,
     )
-    return figure
+    fig.add_shape(
+        type="rect",
+        x0=bounds["R_lower"],
+        x1=bounds["R_upper"],
+        y0=bounds["P_lower"],
+        y1=bounds["P_upper"],
+        line=dict(color="rgba(23,32,51,0.25)", width=1, dash="dot"),
+        fillcolor="rgba(0,0,0,0)",
+    )
 
 
-def _finite_difference_gradient(coef, prices, step: float = 1e-5) -> np.ndarray:
-    prices = np.asarray(prices, dtype=float)
-    numerical = np.zeros(2)
-    for index in range(2):
-        forward = prices.copy()
-        backward = prices.copy()
-        forward[index] += step
-        backward[index] -= step
-        numerical[index] = (revenue(forward, coef) - revenue(backward, coef)) / (2 * step)
-    return numerical
+def shared_figure(detail: dict) -> go.Figure:
+    """All three household lines, the shared feasible region, and one optimum."""
+    bounds = detail["bounds"]
+    solved = detail["shared"]["best"]
+    fig = go.Figure()
+    _shade(fig, solved)
+    span = (bounds["R_lower"] - 2, bounds["R_upper"] + 2)
+    _add_household_lines(fig, detail["households"], bounds, span)
+    _objective_level(fig, solved, bounds)
+    _optimum_marker(fig, solved, bounds)
+    _axis_layout(fig, "Shared prices", bounds)
+    return fig
 
 
-def run_sanity_checks(detail: dict) -> list[str]:
-    """Plausibility checks against the repo data and the exact quadratic maximum."""
-    failures = []
-    results = detail["results"]
-    if results.empty:
-        return ["No household results were produced."]
-    labels = list(results["Household"])
-    if labels != ["Household 1", "Household 2", "Household 3"]:
-        failures.append(
-            f"Expected Household 1, Household 2 and Household 3 from the quantity columns, got {labels}."
-        )
-    for _, row in results.iterrows():
-        label = row["Household"]
-        if row["status"] not in {"optimal", "infeasible", "unbounded", "iteration_limit"}:
-            failures.append(f"{label}: unexpected status {row['status']}.")
+def household_figure(detail: dict, label: str) -> go.Figure:
+    """One household: its own line, its own feasible region, its own optimum."""
+    bounds = detail["bounds"]
+    item = next(entry for entry in detail["per_household"] if entry["household"]["label"] == label)
+    solved = item["programme"]["best"]
+    fig = go.Figure()
+    _shade(fig, solved)
+    span = (bounds["R_lower"] - 2, bounds["R_upper"] + 2)
+    _add_household_lines(fig, [item["household"]], bounds, span)
+    _objective_level(fig, solved, bounds)
+    _optimum_marker(fig, solved, bounds)
+    _axis_layout(fig, label, bounds)
+    fig.update_layout(height=480)
+    return fig
+
+
+def structural_sensitivity_figure(table: pd.DataFrame) -> go.Figure:
+    coef = table[table["kind"] == "line coefficient"]
+    fig = go.Figure()
+    for household, color in LINE_COLOR.items():
+        part = coef[coef["Household"] == household]
+        if part.empty:
             continue
-        if row["status"] != "optimal":
-            failures.append(f"{label}: solver status is {row['status']}, not optimal.")
-            continue
-        if not (row["R_lower"] - 1e-5 <= row["R_opt"] <= row["R_upper"] + 1e-5):
-            failures.append(f"{label}: Regular price {row['R_opt']} is outside bounds.")
-        if not (row["P_lower"] - 1e-5 <= row["P_opt"] <= row["P_upper"] + 1e-5):
-            failures.append(f"{label}: Premium price {row['P_opt']} is outside bounds.")
-        if row["Q_regular"] < -1e-5 or row["Q_premium"] < -1e-5:
-            failures.append(
-                f"{label}: negative demand at the optimum (Q_R={row['Q_regular']}, Q_P={row['Q_premium']})."
+        fig.add_trace(
+            go.Bar(
+                x=[f"{row.parameter} {row.shock}" for row in part.itertuples()],
+                y=part["delta_revenue"],
+                name=household,
+                marker_color=color,
             )
-        coef = coef_from_mapping(row)
-        # The constraint matrix has to move when the coefficients move.
-        system = build_constraint_system(coef, row)
-        slack = system["b_ub"] - system["A_ub"] @ np.array([row["R_opt"], row["P_opt"]])
-        if np.any(slack < -1e-5):
-            failures.append(f"{label}: optimum violates A_ub x <= b_ub.")
-        objective = linear_objective_vector(gradient(np.array([row["R_opt"], row["P_opt"]]), coef))
-        if objective.shape != (2,):
-            failures.append(f"{label}: objective vector is not length 2.")
-        if not np.allclose(objective, -gradient(np.array([row["R_opt"], row["P_opt"]]), coef)):
-            failures.append(f"{label}: objective vector is not the negated gradient.")
-        numerical = _finite_difference_gradient(coef, np.array([row["R_observed_mean"], row["P_observed_mean"]]))
-        analytic = gradient(np.array([row["R_observed_mean"], row["P_observed_mean"]]), coef)
-        if np.max(np.abs(numerical - analytic)) > 1e-3:
-            failures.append(f"{label}: revenue gradient does not match a finite difference.")
-        if np.isfinite(row["revenue_gap"]) and abs(row["revenue_gap"]) > 1e-2:
-            failures.append(
-                f"{label}: LP revenue differs from the exact quadratic maximum by {row['revenue_gap']:.4f}."
-            )
-        if row["revenue_concave"] and abs(row["directional_improvement"]) > 1e-2:
-            failures.append(f"{label}: concave revenue is not stationary at the reported optimum.")
-    # Matrices differ across households because the OLS slopes differ.
-    if len(results) >= 2:
-        first = build_constraint_system(coef_from_mapping(results.iloc[0]), results.iloc[0])
-        second = build_constraint_system(coef_from_mapping(results.iloc[1]), results.iloc[1])
-        if np.allclose(first["A_ub"], second["A_ub"]) and np.allclose(first["b_ub"], second["b_ub"]):
-            failures.append("Household constraint systems are identical; they should follow each OLS fit.")
-    common = detail["common_price"]
-    if len(common) != 1 or common.iloc[0]["status"] != "optimal":
-        failures.append("Common-price aggregate did not solve to optimality.")
-    else:
-        common_row = common.iloc[0]
-        for _, row in results.iterrows():
-            predicted = quantities((common_row["R_opt"], common_row["P_opt"]), coef_from_mapping(row))
-            if predicted[0] < -1e-5 or predicted[1] < -1e-5:
-                failures.append(f"Common price makes {row['Household']} demand negative.")
-        if np.isfinite(common_row["revenue_gap"]) and abs(common_row["revenue_gap"]) > 1e-2:
-            failures.append(
-                f"Common-price LP differs from its quadratic maximum by {common_row['revenue_gap']:.4f}."
-            )
-    regret = regret_table(results, lp_price_menus(results, common))
-    for _, row in results.iterrows():
-        own = regret[
-            (regret["Household"] == row["Household"]) & (regret["Menu"] == f"{row['Household']} LP optimum")
-        ]
-        if own.empty or abs(float(own.iloc[0]["regret"])) > 1e-2:
-            failures.append(f"{row['Household']}: regret at its own LP prices is not zero.")
-        if (regret.loc[regret["Household"] == row["Household"], "regret"] < -1e-2).any():
-            failures.append(f"{row['Household']}: a menu beats the LP optimum, so regret went negative.")
-    return failures
-
-
-def run_solver_edge_cases() -> list[str]:
-    """Infeasible and unbounded programmes should be reported, not raised."""
-    failures = []
-    bounds = {
-        "R_lower": 0.0,
-        "R_upper": 100.0,
-        "P_lower": 0.0,
-        "P_upper": 100.0,
-        "R_observed_min": 0.0,
-        "R_observed_max": 100.0,
-        "P_observed_min": 0.0,
-        "P_observed_max": 100.0,
-        "R_observed_mean": 50.0,
-        "P_observed_mean": 50.0,
-        "upper_sd_multiplier": 0.0,
-    }
-    # Q_R = -1 for every price, so the demand row is 0 <= -1 after the slopes vanish.
-    infeasible = solve_revenue_lp((-1.0, 0.0, 0.0, 1.0, 0.0, -0.01), bounds)
-    if infeasible["status"] != "infeasible":
-        failures.append(f"Expected infeasible status, got {infeasible['status']}.")
-    open_bounds = dict(bounds)
-    open_bounds["R_upper"] = np.inf
-    open_bounds["P_upper"] = np.inf
-    # Q_R = 1 + 0.2 R grows with Regular price, so revenue R*Q_R is unbounded above
-    # once the Regular price has no finite cap. Premium demand still cuts off P.
-    unbounded = solve_revenue_lp((1.0, 0.2, 0.0, 1.0, 0.0, -0.01), open_bounds, preferred_starts=[np.array([10.0, 10.0])])
-    if unbounded["status"] != "unbounded":
-        failures.append(f"Expected unbounded status, got {unbounded['status']}.")
-    # The same increasing Regular demand is bounded once the price guardrail is finite.
-    capped = solve_revenue_lp((1.0, 0.2, 0.0, 1.0, 0.0, -0.01), bounds, preferred_starts=[np.array([10.0, 10.0])])
-    if capped["status"] != "optimal":
-        failures.append(f"Expected the finite guardrail to make the programme optimal, got {capped['status']}.")
-    elif abs(capped["prices"][0] - bounds["R_upper"]) > 1e-2:
-        failures.append(
-            f"Expected Regular price on the upper guardrail, got {capped['prices'][0]:.4f}."
         )
-    return failures
-
-
-def main() -> bool:
-    detail = optimise_prices_detailed()
-    results = detail["results"]
-    columns = [
-        "Household",
-        "R_opt",
-        "P_opt",
-        "max_revenue",
-        "Q_regular",
-        "Q_premium",
-        "status",
-        "revenue_concave",
-        "quadratic_revenue",
-        "revenue_gap",
-        "R_bound_active",
-        "P_bound_active",
-    ]
-    print(FORMULATION_SUMMARY)
-    print()
-    print(results[columns].to_string(index=False, float_format=lambda value: f"{value:.4f}"))
-    print()
-    print(
-        f"Sum of household-specific optima (a separate price menu for each household): "
-        f"€{detail['total_separate_revenue']:.4f}"
+    fig.update_layout(
+        barmode="group",
+        title="Shared revenue change when a fitted line coefficient moves ±10%",
+        yaxis_title="Change in shared revenue (€)",
+        plot_bgcolor="white",
+        paper_bgcolor="white",
+        height=420,
+        margin=dict(l=48, r=16, t=60, b=80),
+        legend=dict(orientation="h", y=1.12),
     )
-    common = detail["common_price"].iloc[0]
-    print(
-        f"Single price menu for every household: R={common['R_opt']:.4f}, P={common['P_opt']:.4f}, "
-        f"revenue=€{common['max_revenue']:.4f}, status={common['status']}"
+    return fig
+
+
+def price_move_figure(table: pd.DataFrame) -> go.Figure:
+    moves = table[table["kind"] == "price move"]
+    fig = go.Figure()
+    for household, color in LINE_COLOR.items():
+        part = moves[moves["Household"] == household]
+        fig.add_trace(
+            go.Bar(
+                x=[f"{row.parameter} {row.shock}" for row in part.itertuples()],
+                y=part["delta_revenue"],
+                name=household,
+                marker_color=color,
+            )
+        )
+    fig.update_layout(
+        barmode="group",
+        title="Revenue change when that household's own optimum price moves ±10%",
+        yaxis_title="Change versus own optimum (€)",
+        plot_bgcolor="white",
+        paper_bgcolor="white",
+        height=420,
+        margin=dict(l=48, r=16, t=60, b=48),
+        legend=dict(orientation="h", y=1.12),
     )
-    print()
-    for _, row in results.iterrows():
-        print(f"{row['Household']}: {row['notes']}")
-        print(
-            f"  OLS Q_R = {row['a_R']:.4f} + ({row['b_RR']:.4f}) R + ({row['b_RP']:.4f}) P"
-            f"    [R²={row['r_squared_regular']:.3f}]"
+    return fig
+
+
+def bound_sensitivity_figure(table: pd.DataFrame) -> go.Figure:
+    fig = go.Figure(
+        go.Bar(
+            x=table["Price box"],
+            y=table["max_revenue"],
+            marker_color="#1677ff",
+            text=[f"R={r:.1f}, P={p:.1f}" for r, p in zip(table["R_opt"], table["P_opt"])],
+            textposition="outside",
         )
-        premium_r2 = "n/a" if not np.isfinite(row["r_squared_premium"]) else f"{row['r_squared_premium']:.3f}"
-        regular_r2_note = premium_r2
-        print(
-            f"  OLS Q_P = {row['a_P']:.4f} + ({row['b_PR']:.4f}) R + ({row['b_PP']:.4f}) P"
-            f"    [R²={regular_r2_note}]"
+    )
+    fig.update_layout(
+        title="Shared revenue as the upper price box widens",
+        yaxis_title="Shared revenue (€)",
+        plot_bgcolor="white",
+        paper_bgcolor="white",
+        height=420,
+        margin=dict(l=48, r=16, t=60, b=48),
+    )
+    return fig
+
+
+def regret_figure(table: pd.DataFrame) -> go.Figure:
+    pivot = table.pivot(index="Household", columns="Menu", values="regret")
+    fig = go.Figure(
+        data=go.Heatmap(
+            z=pivot.to_numpy(),
+            x=list(pivot.columns),
+            y=list(pivot.index),
+            colorscale="Blues",
+            colorbar=dict(title="Regret €"),
+            text=np.round(pivot.to_numpy(), 2),
+            texttemplate="%{text:.2f}",
+            hovertemplate="%{y}<br>%{x}<br>regret €%{z:.2f}<extra></extra>",
         )
+    )
+    fig.update_layout(
+        title="Regret versus each household's own LP optimum",
+        height=360,
+        margin=dict(l=80, r=16, t=60, b=80),
+        paper_bgcolor="white",
+    )
+    return fig
+
+
+def sanity_check(detail: dict) -> list[str]:
+    """Optimum on a vertex, constraints satisfied, revenue equals c·x."""
+    problems = []
+    shared = detail["shared"]["best"]
+    if shared is None:
+        return ["shared programme infeasible"]
+    point = np.array([shared["R"], shared["P"]])
+    if not shared["satisfied"]:
+        problems.append("shared optimum violates A_ub x <= b_ub")
+    if not shared["vertex"]:
+        problems.append("shared optimum is not a vertex")
+    if abs(float(shared["c"] @ point) - shared["revenue"]) > 1e-6:
+        problems.append("shared revenue is not c·x")
+    bounds = detail["bounds"]
+    if not (bounds["R_lower"] - 1e-8 <= shared["R"] <= bounds["R_upper"] + 1e-8):
+        problems.append("shared R outside bounds")
+    if not (bounds["P_lower"] - 1e-8 <= shared["P"] <= bounds["P_upper"] + 1e-8):
+        problems.append("shared P outside bounds")
+    best_revenue = shared["revenue"]
+    for case in detail["shared"]["cases"]:
+        if case["feasible"] and case["revenue"] > best_revenue + 1e-6:
+            problems.append(f"a better assignment was discarded: {case['assignment_label']}")
+    for item in detail["per_household"]:
+        solo = item["programme"]["best"]
+        if solo is None or not solo["vertex"] or not solo["satisfied"]:
+            problems.append(f"{item['household']['label']} optimum failed the vertex check")
+    return problems
+
+
+def _print_report(detail: dict) -> None:
+    print("Per-household lines and fixed quantities")
+    for household in detail["households"]:
+        print(household["label"])
+        for line in household_equations(household):
+            print(" ", line)
+        print(f"  in-sample line accuracy {household['accuracy']:.3f}")
     print()
-    failures = run_sanity_checks(detail) + run_solver_edge_cases()
-    if failures:
-        print("SANITY CHECKS FAILED")
-        for failure in failures:
-            print(f"- {failure}")
-        return False
-    print("SANITY CHECKS PASSED")
-    return True
+    print("Shared linear programme")
+    print(detail["formulation"])
+    print()
+    print("Assignments evaluated")
+    for case in sorted(detail["shared"]["cases"], key=lambda item: item["revenue"], reverse=True):
+        flag = "feasible" if case["feasible"] else "infeasible"
+        revenue = f"{case['revenue']:.4f}" if case["feasible"] else "—"
+        print(f"  {case['assignment_label']}: {flag}, revenue {revenue}")
+    print()
+    print("Per-household optima")
+    for item in detail["per_household"]:
+        best = item["programme"]["best"]
+        print(
+            f"  {item['household']['label']}: {best['assignment_label']}, "
+            f"R={best['R']:.4f}, P={best['P']:.4f}, revenue={best['revenue']:.4f}, vertex={best['vertex']}"
+        )
+    problems = sanity_check(detail)
+    print()
+    print("Sanity:", "ok" if not problems else "; ".join(problems))
 
 
 if __name__ == "__main__":
-    raise SystemExit(0 if main() else 1)
+    _print_report(optimise_prices_detailed())

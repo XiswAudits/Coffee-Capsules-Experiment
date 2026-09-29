@@ -6,13 +6,16 @@ from sklearn.linear_model import LogisticRegression
 
 from price_optimisation import (
     FORMULATION_SUMMARY,
-    assess_price_scenario,
-    feasible_region_figure,
-    lp_price_menus,
+    bound_sensitivity,
+    bound_sensitivity_figure,
+    household_equations,
+    household_figure,
     optimise_prices_detailed,
+    price_move_figure,
     regret_figure,
     regret_table,
-    sensitivity_figure,
+    revenue_of,
+    shared_figure,
     structural_sensitivity,
     structural_sensitivity_figure,
 )
@@ -21,16 +24,11 @@ st.set_page_config(page_title="Coffee Capsules — Demand Model", page_icon="☕
 
 @st.cache_data(show_spinner=False)
 def household_price_lp(csv_name: str):
-    """Per-household revenue LPs. Cached so slider changes do not refit OLS."""
+    """Shared and per-household linear programmes. Cached so sliders do not refit."""
     detail = optimise_prices_detailed(csv_name)
-    structural = structural_sensitivity(detail["results"], pct=0.10)
-    return (
-        detail["results"],
-        detail["sensitivity"],
-        detail["common_price"],
-        float(detail["total_separate_revenue"]),
-        structural,
-    )
+    structural = structural_sensitivity(detail, pct=0.10)
+    bounds = bound_sensitivity(detail)
+    return detail, structural, bounds
 RAW = pd.read_csv("coffee_capsules_data.csv")
 HOUSEHOLDS = {"Household 1": ("HH1_Regular", "HH1_Premium"), "Household 2": ("HH2_Regular", "HH2_Premium"), "Household 3": ("HH3_Regular", "HH3_Premium")}
 CHOICES = ["Regular", "Premium", "No Purchase"]
@@ -119,169 +117,129 @@ with i3: st.markdown(f'<div class="card"><div class="card-title">Current househo
 
 st.markdown('<div id="prices"></div>', unsafe_allow_html=True)
 st.subheader("Revenue-maximising prices")
-# Separate from the logistic classifier above. Each household has its own OLS
-# quantity equations, so each household has its own linear programme. The
-# question is the profit-maximising Premium price P and Regular price R; costs
-# are not in the data, and the LP maximises revenue by changing only prices.
-lp_results, lp_sensitivity, lp_common, lp_total, lp_structural = household_price_lp("coffee_capsules_data.csv")
-lp_row = lp_results.loc[lp_results["Household"] == household].iloc[0]
-scenario_lp = assess_price_scenario(lp_row, regular_price, premium_price)
-scenario_revenue_label = f"€{scenario_lp['revenue']:.2f}" if scenario_lp["feasible"] else "Infeasible"
-common_row = lp_common.iloc[0]
+# One linear programme in R and P. The successive quadratic LP has been retired.
+# Costs are not in the data, so the objective is revenue at fixed purchase quantities.
+lp_detail, lp_structural, lp_bounds = household_price_lp("coffee_capsules_data.csv")
+shared = lp_detail["shared"]["best"]
+selected = next(item for item in lp_detail["per_household"] if item["household"]["label"] == household)
+selected_best = selected["programme"]["best"]
+selected_now = revenue_of(selected["household"], regular_price, premium_price)
+scenario_regret = selected_best["revenue"] - selected_now["revenue"]
 st.markdown(
-    '<div class="card"><div class="card-title">Per-household linear programme</div>'
-    '<div class="card-sub">OLS demand for Regular and Premium quantities, then a successive linear programme in the two prices. '
-    'This is not the logistic classifier drawn above. Constraints keep demand non-negative and stop prices running to infinity. '
-    'Each household is solved on its own coefficients.</div></div>',
+    '<div class="card"><div class="card-title">Whiteboard linear programme</div>'
+    '<div class="card-sub">Each household buys a fixed quantity of one product, so revenue is linear in the Regular price R and the Premium price P. '
+    'The product is chosen by a straight line fitted with OLS. Every product assignment is its own linear programme; the shared menu is the best feasible one. '
+    'This replaces the earlier successive linear programme of quadratic demand.</div></div>',
     unsafe_allow_html=True,
 )
 p1, p2, p3, p4 = st.columns(4)
-p1.metric("Optimal Regular price", f"€{lp_row['R_opt']:.2f}")
-p2.metric("Optimal Premium price", f"€{lp_row['P_opt']:.2f}")
-p3.metric("Maximum revenue", f"€{lp_row['max_revenue']:.2f}")
-p4.metric("Revenue at the scenario", scenario_revenue_label)
-st.markdown(
-    f'<div class="card"><div class="card-title">{household} demand used by the LP</div>'
-    f'<div class="card-sub">OLS fit on this household\'s 11 weeks. R is the Regular price and P is the Premium price.</div>'
-    f'<div class="equation">Qᵣ = {lp_row["a_R"]:.3f} + ({lp_row["b_RR"]:.4f}) R + ({lp_row["b_RP"]:.4f}) P</div>'
-    f'<div class="equation">Qₚ = {lp_row["a_P"]:.3f} + ({lp_row["b_PR"]:.4f}) R + ({lp_row["b_PP"]:.4f}) P</div>'
-    f'<div class="equation">Revenue = R·Qᵣ + P·Qₚ</div></div>',
-    unsafe_allow_html=True,
-)
-if lp_row["notes"]:
-    st.markdown(f'<div class="info">{lp_row["notes"]}</div>', unsafe_allow_html=True)
+p1.metric("Shared Regular price", f"€{shared['R']:.2f}")
+p2.metric("Shared Premium price", f"€{shared['P']:.2f}")
+p3.metric("Shared revenue", f"€{shared['revenue']:.2f}")
+p4.metric(f"{household} at the sliders", f"€{selected_now['revenue']:.2f}")
 
-st.markdown('<div id="feasible-region"></div>', unsafe_allow_html=True)
-st.subheader("Feasible region & linear constraints")
-st.markdown(
-    '<div class="card-sub">One graph per household, with Regular price R on the horizontal axis and Premium price P on the vertical axis. '
-    'Dashed lines are the demand constraints (predicted quantity = 0). Dotted lines are the price bounds, including R ≥ 0 and P ≥ 0. '
-    'The shaded polygon is the feasible region. The star is that household\'s LP optimum.</div>',
-    unsafe_allow_html=True,
-)
-region_columns = st.columns(len(lp_results))
-for region_column, (_, region_row) in zip(region_columns, lp_results.iterrows()):
-    with region_column:
-        scenario_on_panel = (float(regular_price), float(premium_price)) if region_row["Household"] == household else (None, None)
-        st.plotly_chart(
-            feasible_region_figure(
-                region_row,
-                RAW,
-                scenario_on_panel[0],
-                scenario_on_panel[1],
-                height=460,
-            ),
-            use_container_width=True,
-            config={"displayModeBar": False, "responsive": True},
+tab_shared, tab_household = st.tabs(["Shared prices", "Per household"])
+with tab_shared:
+    st.plotly_chart(
+        shared_figure(lp_detail),
+        use_container_width=True,
+        config={"displayModeBar": False, "responsive": True},
+    )
+    st.markdown("**Linear programme**")
+    st.code(lp_detail["formulation"], language="text")
+    case_rows = []
+    for case in lp_detail["shared"]["cases"]:
+        case_rows.append(
+            {
+                "Assignment": case["assignment_label"],
+                "Feasible": "yes" if case["feasible"] else "no",
+                "Revenue €": case["revenue"] if case["feasible"] else None,
+                "R": case["R"] if case["feasible"] else None,
+                "P": case["P"] if case["feasible"] else None,
+                "Chosen": "yes" if case["assignment"] == shared["assignment"] else "",
+            }
         )
-lp_show = lp_results[
-    ["Household", "R_opt", "P_opt", "max_revenue", "Q_regular", "Q_premium", "status", "revenue_gap", "baseline_revenue"]
-].copy()
-lp_show.columns = [
-    "Household",
-    "Optimal Regular €",
-    "Optimal Premium €",
-    "Max revenue €",
-    "Q regular",
-    "Q premium",
-    "LP status",
-    "Gap vs exact quadratic €",
-    "Revenue at mean prices €",
-]
-st.dataframe(lp_show.round(2), use_container_width=True, hide_index=True)
-st.caption(
-    f"Sum of the three household-specific optima: €{lp_total:.2f}. "
-    f"That sum needs a separate price menu for each household. "
-    f"One shared menu from the same LP is Regular €{common_row['R_opt']:.2f} and Premium €{common_row['P_opt']:.2f}, "
-    f"total revenue €{common_row['max_revenue']:.2f}."
-)
-st.markdown('<div id="scenario"></div>', unsafe_allow_html=True)
-st.subheader("Scenario comparison")
+    st.markdown("**Product assignments evaluated as separate linear programmes**")
+    st.dataframe(pd.DataFrame(case_rows).sort_values("Revenue €", ascending=False), use_container_width=True, hide_index=True)
+    st.caption(
+        "Household 1 is a solid line, Household 2 is dashed, Household 3 is long-dashed. "
+        "The shaded polygon is the feasible set of the winning assignment. "
+        "The dotted green line is the objective level through the optimum."
+    )
+
+with tab_household:
+    panels = st.columns(len(lp_detail["per_household"]))
+    for panel, item in zip(panels, lp_detail["per_household"]):
+        hh = item["household"]
+        best = item["programme"]["best"]
+        with panel:
+            st.plotly_chart(
+                household_figure(lp_detail, hh["label"]),
+                use_container_width=True,
+                config={"displayModeBar": False, "responsive": True},
+            )
+            for equation in household_equations(hh):
+                st.markdown(f'<div class="equation">{equation}</div>', unsafe_allow_html=True)
+            st.markdown(
+                f'<div class="info">{best["assignment_label"]}<br>R = {best["R"]:.2f}, P = {best["P"]:.2f}, revenue = €{best["revenue"]:.2f}</div>',
+                unsafe_allow_html=True,
+            )
+            if best.get("flat_price"):
+                st.caption(best["flat_price"])
+
 st.markdown(
-    '<div class="card-sub">The slider pair is one scenario. Each household\'s own LP optimum (P_opt, R_opt) is another. '
-    'Revenue uses that household\'s OLS demand. Regret below is measured against the household\'s own LP optimum.</div>',
+    f'<div class="info">{household} at the slider prices buys {selected_now["product"]} and earns €{selected_now["revenue"]:.2f}. '
+    f'Their own LP optimum earns €{selected_best["revenue"]:.2f}, so the slider leaves €{scenario_regret:.2f} on the table.</div>',
     unsafe_allow_html=True,
 )
-scenario_regret = (
-    float(lp_row["max_revenue"] - scenario_lp["revenue"])
-    if scenario_lp["feasible"] and np.isfinite(scenario_lp["revenue"])
-    else float(lp_row["max_revenue"])
-)
-s1, s2, s3, s4 = st.columns(4)
-s1.metric("Scenario Regular / Premium", f"€{regular_price:.0f} / €{premium_price:.0f}")
-s2.metric("Predicted Regular qty", f"{scenario_lp['Q_regular']:.2f}")
-s3.metric("Predicted Premium qty", f"{scenario_lp['Q_premium']:.2f}")
-s4.metric("Scenario regret", f"€{scenario_regret:.2f}")
-if scenario_lp["feasible"]:
-    st.markdown(
-        f'<div class="info">{household} at the slider prices earns €{scenario_lp["revenue"]:.2f}. '
-        f'The LP optimum earns €{lp_row["max_revenue"]:.2f}, so the slider leaves €{scenario_regret:.2f} on the table.</div>',
-        unsafe_allow_html=True,
-    )
-else:
-    st.markdown(
-        '<div class="info">This scenario is outside the feasible region: predicted demand is negative or a price is outside the guardrail. '
-        'The household is treated as stopping, no revenue is booked, and regret equals the whole LP optimum.</div>',
-        unsafe_allow_html=True,
-    )
 
 st.markdown('<div id="sensitivity"></div>', unsafe_allow_html=True)
 st.subheader("Structural test & sensitivity analysis")
 st.markdown(
-    "Around each household LP optimum, every OLS coefficient is shocked by ±10% and the linear programme is solved again. "
-    "R and P are also moved ±10% off the optimum with the other price held fixed, which tests revenue without changing the demand fit. "
-    "The guardrail chart below is the separate check that widens the upper price cap."
+    "Each fitted line coefficient is moved by ±10% and the shared linear programme is solved again. "
+    "Separately, each household's own optimal price is moved ±10% and revenue is recomputed from the same lines. "
+    "The last chart widens the upper price box past the highest price observed in the experiment."
 )
 st.plotly_chart(
     structural_sensitivity_figure(lp_structural),
     use_container_width=True,
     config={"displayModeBar": False, "responsive": True},
 )
-structural_show = lp_structural[
-    ["Household", "kind", "parameter", "shock", "R_opt", "P_opt", "max_revenue", "delta_R", "delta_P", "delta_revenue", "status"]
+structural_show = lp_structural[lp_structural["kind"] == "line coefficient"][
+    ["Household", "parameter", "shock", "R_opt", "P_opt", "max_revenue", "delta_revenue", "assignment", "status"]
 ].copy()
 structural_show.columns = [
-    "Household",
-    "Test",
-    "Parameter",
+    "Household whose line moved",
+    "Coefficient",
     "Shock",
-    "R after €",
-    "P after €",
-    "Revenue after €",
-    "Δ R €",
-    "Δ P €",
-    "Δ revenue €",
+    "Shared R €",
+    "Shared P €",
+    "Shared revenue €",
+    "Δ shared revenue €",
+    "Assignment",
     "Status",
 ]
 st.dataframe(structural_show.round(2), use_container_width=True, hide_index=True)
-st.plotly_chart(sensitivity_figure(lp_sensitivity), use_container_width=True, config={"displayModeBar": False, "responsive": True})
-sens_show = lp_sensitivity[
-    ["Household", "upper_sd_multiplier", "R_upper", "P_upper", "R_opt", "P_opt", "max_revenue", "Q_regular", "Q_premium"]
-].copy()
-sens_show.columns = [
-    "Household",
-    "Extra SDs on the cap",
-    "Regular cap €",
-    "Premium cap €",
-    "Optimal Regular €",
-    "Optimal Premium €",
-    "Max revenue €",
-    "Q regular",
-    "Q premium",
-]
-st.dataframe(sens_show.round(2), use_container_width=True, hide_index=True)
+st.plotly_chart(
+    price_move_figure(lp_structural),
+    use_container_width=True,
+    config={"displayModeBar": False, "responsive": True},
+)
+st.plotly_chart(
+    bound_sensitivity_figure(lp_bounds),
+    use_container_width=True,
+    config={"displayModeBar": False, "responsive": True},
+)
+st.dataframe(lp_bounds.round(2), use_container_width=True, hide_index=True)
 
 st.markdown('<div id="regret"></div>', unsafe_allow_html=True)
 st.subheader("Scenario comparison & regret matrix")
 st.markdown(
-    "Each column is a price scenario. The LP-optimum columns use that household's solved P_opt and R_opt. "
-    "Regret is own maximum revenue minus revenue at the scenario. The cell on a household's own LP optimum is zero. "
-    "An infeasible scenario books no revenue, so regret equals the whole optimum."
+    "Columns are the shared optimum, each household's own optimum, and the slider scenario. "
+    "Revenue is the fixed quantity times the price of the product that household's line says they buy. "
+    "Regret is that household's own LP revenue minus revenue at the menu. The cell on a household's own optimum is zero."
 )
-lp_regret = regret_table(
-    lp_results,
-    lp_price_menus(lp_results, lp_common, scenario=(regular_price, premium_price)),
-)
+lp_regret = regret_table(lp_detail, scenario=(regular_price, premium_price))
 st.plotly_chart(regret_figure(lp_regret), use_container_width=True, config={"displayModeBar": False, "responsive": True})
 st.markdown("**Revenue by scenario (€)**")
 st.dataframe(lp_regret.pivot(index="Household", columns="Menu", values="revenue").round(2), use_container_width=True)
@@ -290,17 +248,8 @@ st.dataframe(lp_regret.pivot(index="Household", columns="Menu", values="regret")
 
 with st.expander("How the linear programme is set up"):
     st.markdown(FORMULATION_SUMMARY)
-    st.markdown(
-        """
-The objective passed to `scipy.optimize.linprog` is the negated gradient of revenue, because HiGHS minimises. Each iteration maximises the first-order Taylor expansion of quadratic revenue inside a trust box, accepts the step only when the true quadratic revenue rises, and rebuilds `A_ub x <= b_ub` from that household's OLS slopes:
+    st.code(lp_detail["formulation"], language="text")
 
-- Regular demand stays non-negative
-- Premium demand stays non-negative
-- Regular price and Premium price stay between 0 and a guardrail at the observed maximum plus one sample standard deviation
-
-The reported revenue is the quadratic revenue at the prices the LP returns, not the linear surrogate. On this dataset it matches the exact maximum of that quadratic on the same polygon.
-        """
-    )
 st.markdown('<div id="methodology"></div>',unsafe_allow_html=True);st.subheader("Model & methodology")
 with st.expander("Step-by-step explanation"):
     st.markdown(f"""### 1. Start with the original data
