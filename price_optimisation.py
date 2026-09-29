@@ -719,8 +719,13 @@ def exact_quadratic_optimum(coef, system: dict):
     return {"R": float(best[0]), "P": float(best[1]), "revenue": float(revenue(best, coef))}
 
 
-def solve_revenue_lp(coef, price_bounds: dict, preferred_starts=None) -> dict:
-    """Solve one household (or any single linear-demand system) by successive LPs."""
+def solve_revenue_lp(coef, price_bounds: dict, preferred_starts=None, quick: bool = False) -> dict:
+    """Solve one household (or any single linear-demand system) by successive LPs.
+
+    ``quick`` starts only from the preferred prices. The sensitivity re-solves
+    use it so each coefficient shock stays near the household optimum instead
+    of restarting from every vertex.
+    """
     system = build_constraint_system(coef, price_bounds)
     if system["infeasible"] or is_revenue_unbounded(coef, system):
         status = "infeasible" if system["infeasible"] else "unbounded"
@@ -736,7 +741,12 @@ def solve_revenue_lp(coef, price_bounds: dict, preferred_starts=None) -> dict:
         solved["revenue_gap"] = np.nan
         return solved
     preferred = [] if preferred_starts is None else list(preferred_starts)
-    starts = candidate_starts(system, preferred)
+    if quick and preferred:
+        starts = [point for point in dedupe_points(preferred) if is_feasible(point, system["A_ub"], system["b_ub"])]
+        if not starts:
+            starts = candidate_starts(system, preferred)
+    else:
+        starts = candidate_starts(system, preferred)
     solved = successive_linear_programme(
         revenue_fn=lambda prices: revenue(prices, coef),
         gradient_fn=lambda prices: gradient(prices, coef),
@@ -1191,6 +1201,25 @@ def feasible_region_figure(
                 line={"color": "#ff8a1f", "width": 2, "dash": "dash"},
             )
         )
+    # Price bounds are linear constraints too: non-negativity and the upper guardrail.
+    r_lo, r_hi = price_bounds["R_lower"], price_bounds["R_upper"]
+    p_lo, p_hi = price_bounds["P_lower"], price_bounds["P_upper"]
+    for name, xs, ys in (
+        ("R ≥ 0" if abs(r_lo) < 1e-9 else f"R ≥ {r_lo:.2f}", [r_lo, r_lo], [p_lo, p_hi]),
+        (f"R ≤ {r_hi:.2f}", [r_hi, r_hi], [p_lo, p_hi]),
+        ("P ≥ 0" if abs(p_lo) < 1e-9 else f"P ≥ {p_lo:.2f}", [r_lo, r_hi], [p_lo, p_lo]),
+        (f"P ≤ {p_hi:.2f}", [r_lo, r_hi], [p_hi, p_hi]),
+    ):
+        figure.add_trace(
+            go.Scatter(
+                x=xs,
+                y=ys,
+                mode="lines",
+                name=name,
+                line={"color": "#98a2b3", "width": 1.5, "dash": "dot"},
+                hovertemplate=f"{name}<extra></extra>",
+            )
+        )
     observed = observed_prices[["P_Regular", "P_Premium"]].drop_duplicates()
     figure.add_trace(
         go.Scatter(
@@ -1217,27 +1246,24 @@ def feasible_region_figure(
     if np.isfinite(result_row["R_opt"]) and np.isfinite(result_row["P_opt"]):
         optimum_r = float(result_row["R_opt"])
         optimum_p = float(result_row["P_opt"])
+        optimum_label = (
+            f"Optimal: P={optimum_p:.2f}, R={optimum_r:.2f}, Rev={float(result_row['max_revenue']):.2f}"
+        )
         figure.add_trace(
             go.Scatter(
                 x=[optimum_r],
                 y=[optimum_p],
-                mode="markers+text",
+                mode="markers",
                 name="LP optimum",
-                text=[f"{household} optimum"],
-                textposition="top center",
-                textfont={"size": 11, "color": "#172033"},
                 marker={"symbol": "star", "size": 18, "color": "#172033", "line": {"color": "white", "width": 1}},
-                hovertemplate=(
-                    f"{household} optimum<br>Regular €%{{x:.2f}}<br>Premium €%{{y:.2f}}<br>"
-                    f"Revenue €{result_row['max_revenue']:.2f}<extra></extra>"
-                ),
+                hovertemplate=f"{optimum_label}<extra></extra>",
             )
         )
         label_below = optimum_p > p_lower + 0.62 * (p_upper - p_lower)
         figure.add_annotation(
             x=optimum_r,
             y=optimum_p,
-            text=f"R €{optimum_r:.2f}<br>P €{optimum_p:.2f}<br>€{float(result_row['max_revenue']):.0f}",
+            text=optimum_label,
             showarrow=True,
             arrowhead=2,
             arrowcolor="#172033",
@@ -1322,6 +1348,114 @@ def sensitivity_figure(sensitivity: pd.DataFrame):
     return figure
 
 
+def _bounds_from_result_row(row) -> dict:
+    keys = (
+        "R_lower",
+        "R_upper",
+        "P_lower",
+        "P_upper",
+        "R_observed_min",
+        "R_observed_max",
+        "P_observed_min",
+        "P_observed_max",
+        "R_observed_mean",
+        "P_observed_mean",
+        "upper_sd_multiplier",
+    )
+    return {key: float(row[key]) for key in keys}
+
+
+def structural_sensitivity(results: pd.DataFrame, pct: float = 0.10) -> pd.DataFrame:
+    """Re-solve the household LP after shocking each OLS coefficient by ±pct.
+
+    Price rows are not re-solves. They move the LP optimum's R or P by ±pct,
+    hold the other price, and recompute revenue. That is the local price test
+    around the optimum the programme actually returned.
+    """
+    rows = []
+    for _, household in results.iterrows():
+        if household["status"] != "optimal" or not np.isfinite(household["R_opt"]):
+            continue
+        base_coef = coef_from_mapping(household)
+        bounds = _bounds_from_result_row(household)
+        base_prices = np.array([float(household["R_opt"]), float(household["P_opt"])], dtype=float)
+        base_revenue = float(household["max_revenue"])
+        for index, name in enumerate(COEF_NAMES):
+            for sign in (1.0, -1.0):
+                shocked = list(base_coef)
+                shocked[index] = base_coef[index] * (1.0 + sign * pct)
+                solved = solve_revenue_lp(tuple(shocked), bounds, preferred_starts=[base_prices], quick=True)
+                solved_r = float(solved["prices"][0])
+                solved_p = float(solved["prices"][1])
+                solved_revenue = float(solved["revenue"]) if np.isfinite(solved["revenue"]) else np.nan
+                rows.append(
+                    {
+                        "Household": household["Household"],
+                        "kind": "coefficient",
+                        "parameter": name,
+                        "shock": sign * pct,
+                        "R_opt": solved_r,
+                        "P_opt": solved_p,
+                        "max_revenue": solved_revenue,
+                        "delta_R": solved_r - base_prices[0],
+                        "delta_P": solved_p - base_prices[1],
+                        "delta_revenue": solved_revenue - base_revenue if np.isfinite(solved_revenue) else np.nan,
+                        "status": solved["status"],
+                    }
+                )
+        for price_name, index in (("R", 0), ("P", 1)):
+            for sign in (1.0, -1.0):
+                prices = base_prices.copy()
+                prices[index] = base_prices[index] * (1.0 + sign * pct)
+                assessed = assess_price_scenario(household, float(prices[0]), float(prices[1]))
+                earned = float(assessed["revenue"]) if assessed["feasible"] and np.isfinite(assessed["revenue"]) else np.nan
+                rows.append(
+                    {
+                        "Household": household["Household"],
+                        "kind": "price",
+                        "parameter": price_name,
+                        "shock": sign * pct,
+                        "R_opt": float(prices[0]),
+                        "P_opt": float(prices[1]),
+                        "max_revenue": earned,
+                        "delta_R": float(prices[0] - base_prices[0]),
+                        "delta_P": float(prices[1] - base_prices[1]),
+                        "delta_revenue": earned - base_revenue if np.isfinite(earned) else np.nan,
+                        "status": "feasible" if assessed["feasible"] else "infeasible",
+                    }
+                )
+    return pd.DataFrame(rows)
+
+
+def structural_sensitivity_figure(structural: pd.DataFrame):
+    """Revenue change when each OLS coefficient is raised by the sensitivity shock."""
+    figure = go.Figure()
+    positive = structural[(structural["kind"] == "coefficient") & (structural["shock"] > 0)]
+    for household, group in positive.groupby("Household", sort=False):
+        figure.add_trace(
+            go.Bar(
+                x=group["parameter"],
+                y=group["delta_revenue"],
+                name=str(household),
+                hovertemplate=f"{household}<br>%{{x}} +shock<br>Δ revenue €%{{y:.2f}}<extra></extra>",
+            )
+        )
+    figure.update_layout(
+        barmode="group",
+        height=420,
+        margin={"l": 10, "r": 10, "t": 36, "b": 10},
+        title={"text": "Revenue change after raising each OLS coefficient", "font": {"size": 14}},
+        paper_bgcolor="white",
+        plot_bgcolor="white",
+        font={"family": "Inter, Arial, sans-serif", "color": "#172033"},
+        xaxis={"title": "Shocked coefficient", "gridcolor": "#e8edf3"},
+        yaxis={"title": "Change in max revenue (€)", "gridcolor": "#e8edf3", "zeroline": True},
+        legend={"orientation": "h", "y": 1.12, "x": 0},
+        hoverlabel={"bgcolor": "white"},
+    )
+    return figure
+
+
 def regret_table(results: pd.DataFrame, menus: dict) -> pd.DataFrame:
     """Revenue regret of charging every household each named price menu.
 
@@ -1365,7 +1499,7 @@ def lp_price_menus(results: pd.DataFrame, common_price: pd.DataFrame, scenario=N
     """Menus the regret table compares: each household optimum, the shared menu, and an optional scenario."""
     menus = {}
     for _, row in results.iterrows():
-        menus[f"{row['Household']} LP prices"] = (float(row["R_opt"]), float(row["P_opt"]))
+        menus[f"{row['Household']} LP optimum"] = (float(row["R_opt"]), float(row["P_opt"]))
     common = common_price.iloc[0]
     menus["Shared LP menu"] = (float(common["R_opt"]), float(common["P_opt"]))
     if len(results):
@@ -1488,7 +1622,7 @@ def run_sanity_checks(detail: dict) -> list[str]:
     regret = regret_table(results, lp_price_menus(results, common))
     for _, row in results.iterrows():
         own = regret[
-            (regret["Household"] == row["Household"]) & (regret["Menu"] == f"{row['Household']} LP prices")
+            (regret["Household"] == row["Household"]) & (regret["Menu"] == f"{row['Household']} LP optimum")
         ]
         if own.empty or abs(float(own.iloc[0]["regret"])) > 1e-2:
             failures.append(f"{row['Household']}: regret at its own LP prices is not zero.")

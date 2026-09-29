@@ -83,7 +83,7 @@ The sum of those separate optima is **€1,051.11**. One shared menu is about **
 
 Household 1 is an interior maximum of a concave revenue function, just above the highest observed Regular price (€65). Households 2 and 3 are not concave in Regular price: optimal Regular sits on the upper guardrail, and widening that guardrail moves their solution. Household 3 never bought Regular, so those OLS slopes are zero and the optimum extrapolates Premium below the experimental prices. Treat the prices as an exploratory calculation on 11 weeks, not as a validated tariff.
 
-The root app plots each household's feasible region (shaded polygon, demand-constraint lines, labelled optimum), a scenario evaluation at the price sliders, the guardrail sensitivity, and regret. Regret is the household's own maximum revenue minus revenue at another menu (another household's optimum, the shared menu, the experiment mean, or the sliders). An infeasible menu books no revenue, so regret equals the whole optimum. Charging a household its own LP prices has regret zero.
+The app sections read `P_opt`, `R_opt`, and maximum revenue from the per-household LP. Each feasible-region graph draws the demand constraints, the price bounds (including non-negativity), the shaded feasible set, and a label `Optimal: P=…, R=…, Rev=…`. Sensitivity re-solves after a ±10% shock to each OLS coefficient and also moves each optimal price by ±10%. The regret matrix treats every household LP optimum as a scenario; regret against a household's own optimum is zero.
 
 ## Dataset
 

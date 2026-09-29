@@ -13,6 +13,8 @@ from price_optimisation import (
     regret_figure,
     regret_table,
     sensitivity_figure,
+    structural_sensitivity,
+    structural_sensitivity_figure,
 )
 
 st.set_page_config(page_title="Coffee Capsules — Demand Model", page_icon="☕", layout="wide", initial_sidebar_state="collapsed")
@@ -21,7 +23,14 @@ st.set_page_config(page_title="Coffee Capsules — Demand Model", page_icon="☕
 def household_price_lp(csv_name: str):
     """Per-household revenue LPs. Cached so slider changes do not refit OLS."""
     detail = optimise_prices_detailed(csv_name)
-    return detail["results"], detail["sensitivity"], detail["common_price"], float(detail["total_separate_revenue"])
+    structural = structural_sensitivity(detail["results"], pct=0.10)
+    return (
+        detail["results"],
+        detail["sensitivity"],
+        detail["common_price"],
+        float(detail["total_separate_revenue"]),
+        structural,
+    )
 RAW = pd.read_csv("coffee_capsules_data.csv")
 HOUSEHOLDS = {"Household 1": ("HH1_Regular", "HH1_Premium"), "Household 2": ("HH2_Regular", "HH2_Premium"), "Household 3": ("HH3_Regular", "HH3_Premium")}
 CHOICES = ["Regular", "Premium", "No Purchase"]
@@ -114,7 +123,7 @@ st.subheader("Revenue-maximising prices")
 # quantity equations, so each household has its own linear programme. The
 # question is the profit-maximising Premium price P and Regular price R; costs
 # are not in the data, and the LP maximises revenue by changing only prices.
-lp_results, lp_sensitivity, lp_common, lp_total = household_price_lp("coffee_capsules_data.csv")
+lp_results, lp_sensitivity, lp_common, lp_total, lp_structural = household_price_lp("coffee_capsules_data.csv")
 lp_row = lp_results.loc[lp_results["Household"] == household].iloc[0]
 scenario_lp = assess_price_scenario(lp_row, regular_price, premium_price)
 scenario_revenue_label = f"€{scenario_lp['revenue']:.2f}" if scenario_lp["feasible"] else "Infeasible"
@@ -143,11 +152,11 @@ if lp_row["notes"]:
     st.markdown(f'<div class="info">{lp_row["notes"]}</div>', unsafe_allow_html=True)
 
 st.markdown('<div id="feasible-region"></div>', unsafe_allow_html=True)
-st.subheader("Feasible region")
+st.subheader("Feasible region & linear constraints")
 st.markdown(
-    '<div class="card-sub">Shaded area: prices that keep predicted demand non-negative and inside the guardrail. '
-    'Dashed lines: the demand constraints (the household stops buying that capsule). '
-    'Star: that household\'s labelled LP optimum.</div>',
+    '<div class="card-sub">One graph per household, with Regular price R on the horizontal axis and Premium price P on the vertical axis. '
+    'Dashed lines are the demand constraints (predicted quantity = 0). Dotted lines are the price bounds, including R ≥ 0 and P ≥ 0. '
+    'The shaded polygon is the feasible region. The star is that household\'s LP optimum.</div>',
     unsafe_allow_html=True,
 )
 region_columns = st.columns(len(lp_results))
@@ -187,10 +196,10 @@ st.caption(
     f"total revenue €{common_row['max_revenue']:.2f}."
 )
 st.markdown('<div id="scenario"></div>', unsafe_allow_html=True)
-st.subheader("Scenario")
+st.subheader("Scenario comparison")
 st.markdown(
-    '<div class="card-sub">The scenario is the Regular and Premium pair on the sliders at the top of the page. '
-    'Revenue here is the OLS quantity model inside the linear programme, not the logistic classifier.</div>',
+    '<div class="card-sub">The slider pair is one scenario. Each household\'s own LP optimum (P_opt, R_opt) is another. '
+    'Revenue uses that household\'s OLS demand. Regret below is measured against the household\'s own LP optimum.</div>',
     unsafe_allow_html=True,
 )
 scenario_regret = (
@@ -217,12 +226,34 @@ else:
     )
 
 st.markdown('<div id="sensitivity"></div>', unsafe_allow_html=True)
-st.subheader("Sensitivity")
+st.subheader("Structural test & sensitivity analysis")
 st.markdown(
-    "The upper price guardrail is what stops a non-concave household from sending Regular price to infinity. "
-    "Moving it from the observed maximum, to one sample standard deviation beyond it, to two, is the LP sensitivity check. "
-    "Household 1's revenue hill is interior, so the cap does not move it."
+    "Around each household LP optimum, every OLS coefficient is shocked by ±10% and the linear programme is solved again. "
+    "R and P are also moved ±10% off the optimum with the other price held fixed, which tests revenue without changing the demand fit. "
+    "The guardrail chart below is the separate check that widens the upper price cap."
 )
+st.plotly_chart(
+    structural_sensitivity_figure(lp_structural),
+    use_container_width=True,
+    config={"displayModeBar": False, "responsive": True},
+)
+structural_show = lp_structural[
+    ["Household", "kind", "parameter", "shock", "R_opt", "P_opt", "max_revenue", "delta_R", "delta_P", "delta_revenue", "status"]
+].copy()
+structural_show.columns = [
+    "Household",
+    "Test",
+    "Parameter",
+    "Shock",
+    "R after €",
+    "P after €",
+    "Revenue after €",
+    "Δ R €",
+    "Δ P €",
+    "Δ revenue €",
+    "Status",
+]
+st.dataframe(structural_show.round(2), use_container_width=True, hide_index=True)
 st.plotly_chart(sensitivity_figure(lp_sensitivity), use_container_width=True, config={"displayModeBar": False, "responsive": True})
 sens_show = lp_sensitivity[
     ["Household", "upper_sd_multiplier", "R_upper", "P_upper", "R_opt", "P_opt", "max_revenue", "Q_regular", "Q_premium"]
@@ -241,19 +272,21 @@ sens_show.columns = [
 st.dataframe(sens_show.round(2), use_container_width=True, hide_index=True)
 
 st.markdown('<div id="regret"></div>', unsafe_allow_html=True)
-st.subheader("Regret")
+st.subheader("Scenario comparison & regret matrix")
 st.markdown(
-    "Regret is the revenue a household gives up by facing some other price menu instead of its own LP optimum. "
-    "Menus are the three household optima, the single shared menu, the experiment's mean prices, and the current scenario. "
-    "An infeasible menu books no revenue, so regret equals that household's entire optimum."
+    "Each column is a price scenario. The LP-optimum columns use that household's solved P_opt and R_opt. "
+    "Regret is own maximum revenue minus revenue at the scenario. The cell on a household's own LP optimum is zero. "
+    "An infeasible scenario books no revenue, so regret equals the whole optimum."
 )
 lp_regret = regret_table(
     lp_results,
     lp_price_menus(lp_results, lp_common, scenario=(regular_price, premium_price)),
 )
 st.plotly_chart(regret_figure(lp_regret), use_container_width=True, config={"displayModeBar": False, "responsive": True})
-regret_show = lp_regret.pivot(index="Household", columns="Menu", values="regret")
-st.dataframe(regret_show.round(2), use_container_width=True)
+st.markdown("**Revenue by scenario (€)**")
+st.dataframe(lp_regret.pivot(index="Household", columns="Menu", values="revenue").round(2), use_container_width=True)
+st.markdown("**Regret versus that household's LP optimum (€)**")
+st.dataframe(lp_regret.pivot(index="Household", columns="Menu", values="regret").round(2), use_container_width=True)
 
 with st.expander("How the linear programme is set up"):
     st.markdown(FORMULATION_SUMMARY)
