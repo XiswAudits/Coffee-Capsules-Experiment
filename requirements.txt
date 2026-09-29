@@ -3,5 +3,5 @@ pandas>=2.0
 numpy>=1.24
 plotly>=5.20
 scikit-learn>=1.4
-# scipy.optimize.linprog (HiGHS) solves the per-household revenue LP
+# scipy.optimize.linprog (HiGHS) solves the whiteboard price LP
 scipy>=1.11
