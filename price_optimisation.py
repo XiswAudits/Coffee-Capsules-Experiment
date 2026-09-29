@@ -1083,12 +1083,26 @@ def _zero_demand_segment(intercept, slope_regular, slope_premium, price_bounds, 
     return np.array([]), np.array([])
 
 
-def feasible_region_figure(result_row, observed_prices, scenario_regular=None, scenario_premium=None):
-    """Price-plane figure: demand boundaries, feasible polygon, LP optimum.
+def _ordered_polygon(vertices: list[np.ndarray]) -> tuple[list[float], list[float]]:
+    centre = np.mean(np.vstack(vertices), axis=0)
+    ordered = sorted(vertices, key=lambda point: np.arctan2(point[1] - centre[1], point[0] - centre[0]))
+    regular = [float(point[0]) for point in ordered] + [float(ordered[0][0])]
+    premium = [float(point[1]) for point in ordered] + [float(ordered[0][1])]
+    return regular, premium
 
-    ``observed_prices`` needs columns ``P_Regular`` and ``P_Premium``. The
-    logistic decision map in the dashboard is a different model; this figure
-    is the OLS feasible set the linear programme actually uses.
+
+def feasible_region_figure(
+    result_row,
+    observed_prices,
+    scenario_regular=None,
+    scenario_premium=None,
+    height: int = 520,
+):
+    """Price-plane figure for one household.
+
+    Draws the LP feasible set as a shaded polygon, the demand-boundary
+    constraint lines, and a labelled marker at that household's optimal
+    prices. ``observed_prices`` needs columns ``P_Regular`` and ``P_Premium``.
     """
     coef = coef_from_mapping(result_row)
     price_bounds = {
@@ -1142,16 +1156,15 @@ def feasible_region_figure(result_row, observed_prices, scenario_regular=None, s
         )
     vertices = polygon_vertices(system["A_ub"], system["b_ub"])
     if len(vertices) >= 3:
-        centre = np.mean(np.vstack(vertices), axis=0)
-        ordered = sorted(vertices, key=lambda point: np.arctan2(point[1] - centre[1], point[0] - centre[0]))
-        polygon_r = [point[0] for point in ordered] + [ordered[0][0]]
-        polygon_p = [point[1] for point in ordered] + [ordered[0][1]]
+        polygon_r, polygon_p = _ordered_polygon(vertices)
         figure.add_trace(
             go.Scatter(
                 x=polygon_r,
                 y=polygon_p,
                 mode="lines",
-                name="Feasible boundary",
+                name="Feasible region",
+                fill="toself",
+                fillcolor="rgba(22,119,255,0.22)",
                 line={"color": "#172033", "width": 2},
                 hoverinfo="skip",
             )
@@ -1200,25 +1213,45 @@ def feasible_region_figure(result_row, observed_prices, scenario_regular=None, s
                 hovertemplate="Scenario<br>Regular €%{x:.1f}<br>Premium €%{y:.1f}<extra></extra>",
             )
         )
+    household = result_row["Household"] if "Household" in result_row.index else "Household"
     if np.isfinite(result_row["R_opt"]) and np.isfinite(result_row["P_opt"]):
+        optimum_r = float(result_row["R_opt"])
+        optimum_p = float(result_row["P_opt"])
         figure.add_trace(
             go.Scatter(
-                x=[result_row["R_opt"]],
-                y=[result_row["P_opt"]],
-                mode="markers",
+                x=[optimum_r],
+                y=[optimum_p],
+                mode="markers+text",
                 name="LP optimum",
+                text=[f"{household} optimum"],
+                textposition="top center",
+                textfont={"size": 11, "color": "#172033"},
                 marker={"symbol": "star", "size": 18, "color": "#172033", "line": {"color": "white", "width": 1}},
                 hovertemplate=(
-                    "LP optimum<br>Regular €%{x:.2f}<br>Premium €%{y:.2f}<br>"
+                    f"{household} optimum<br>Regular €%{{x:.2f}}<br>Premium €%{{y:.2f}}<br>"
                     f"Revenue €{result_row['max_revenue']:.2f}<extra></extra>"
                 ),
             )
         )
+        label_below = optimum_p > p_lower + 0.62 * (p_upper - p_lower)
+        figure.add_annotation(
+            x=optimum_r,
+            y=optimum_p,
+            text=f"R €{optimum_r:.2f}<br>P €{optimum_p:.2f}<br>€{float(result_row['max_revenue']):.0f}",
+            showarrow=True,
+            arrowhead=2,
+            arrowcolor="#172033",
+            ax=46,
+            ay=42 if label_below else -46,
+            bgcolor="white",
+            bordercolor="#172033",
+            borderwidth=1,
+            font={"size": 11, "color": "#172033"},
+        )
     pad_r = 0.06 * (r_upper - r_lower)
     pad_p = 0.06 * (p_upper - p_lower)
-    household = result_row["Household"] if "Household" in result_row.index else "Household"
     figure.update_layout(
-        height=520,
+        height=height,
         margin={"l": 10, "r": 10, "t": 36, "b": 10},
         title={"text": f"{household}: OLS feasible prices and revenue", "font": {"size": 14}},
         paper_bgcolor="white",
@@ -1283,6 +1316,90 @@ def sensitivity_figure(sensitivity: pd.DataFrame):
         font={"family": "Inter, Arial, sans-serif", "color": "#172033"},
         xaxis={"title": "Upper bound on Regular price (€)", "gridcolor": "#e8edf3", "zeroline": False},
         yaxis={"title": "Optimal Regular price (€)", "gridcolor": "#e8edf3", "zeroline": False},
+        legend={"orientation": "h", "y": 1.12, "x": 0},
+        hoverlabel={"bgcolor": "white"},
+    )
+    return figure
+
+
+def regret_table(results: pd.DataFrame, menus: dict) -> pd.DataFrame:
+    """Revenue regret of charging every household each named price menu.
+
+    Regret is the household's own LP maximum minus the revenue earned at the
+    menu. A menu that drives predicted demand negative, or that leaves the
+    price guardrail, is not a feasible plan: no revenue is booked and regret
+    equals the whole optimum. Own-menu regret is zero when the LP solution
+    is feasible, which is the check that the optimum really is best inside
+    the constraint set.
+    """
+    rows = []
+    for _, household in results.iterrows():
+        optimum = float(household["max_revenue"])
+        for menu_name, prices in menus.items():
+            regular_price, premium_price = prices
+            assessed = assess_price_scenario(household, float(regular_price), float(premium_price))
+            if assessed["feasible"] and np.isfinite(assessed["revenue"]):
+                earned = float(assessed["revenue"])
+                regret = optimum - earned
+            else:
+                earned = np.nan
+                regret = optimum
+            rows.append(
+                {
+                    "Household": household["Household"],
+                    "Menu": menu_name,
+                    "R": float(regular_price),
+                    "P": float(premium_price),
+                    "revenue": earned,
+                    "feasible": bool(assessed["feasible"]),
+                    "Q_regular": assessed["Q_regular"],
+                    "Q_premium": assessed["Q_premium"],
+                    "regret": float(regret),
+                    "own_max_revenue": optimum,
+                }
+            )
+    return pd.DataFrame(rows)
+
+
+def lp_price_menus(results: pd.DataFrame, common_price: pd.DataFrame, scenario=None) -> dict:
+    """Menus the regret table compares: each household optimum, the shared menu, and an optional scenario."""
+    menus = {}
+    for _, row in results.iterrows():
+        menus[f"{row['Household']} LP prices"] = (float(row["R_opt"]), float(row["P_opt"]))
+    common = common_price.iloc[0]
+    menus["Shared LP menu"] = (float(common["R_opt"]), float(common["P_opt"]))
+    if len(results):
+        menus["Experiment mean prices"] = (
+            float(results.iloc[0]["R_observed_mean"]),
+            float(results.iloc[0]["P_observed_mean"]),
+        )
+    if scenario is not None:
+        menus["Scenario sliders"] = (float(scenario[0]), float(scenario[1]))
+    return menus
+
+
+def regret_figure(regret: pd.DataFrame):
+    """Grouped bars of LP regret by price menu and household."""
+    figure = go.Figure()
+    for household, group in regret.groupby("Household", sort=False):
+        figure.add_trace(
+            go.Bar(
+                x=group["Menu"],
+                y=group["regret"],
+                name=str(household),
+                hovertemplate=f"{household}<br>%{{x}}<br>Regret €%{{y:.2f}}<extra></extra>",
+            )
+        )
+    figure.update_layout(
+        barmode="group",
+        height=420,
+        margin={"l": 10, "r": 10, "t": 36, "b": 10},
+        title={"text": "Regret against each household's own LP optimum", "font": {"size": 14}},
+        paper_bgcolor="white",
+        plot_bgcolor="white",
+        font={"family": "Inter, Arial, sans-serif", "color": "#172033"},
+        xaxis={"title": "Price menu", "gridcolor": "#e8edf3"},
+        yaxis={"title": "Regret (€)", "gridcolor": "#e8edf3", "zeroline": False},
         legend={"orientation": "h", "y": 1.12, "x": 0},
         hoverlabel={"bgcolor": "white"},
     )
@@ -1368,6 +1485,15 @@ def run_sanity_checks(detail: dict) -> list[str]:
             failures.append(
                 f"Common-price LP differs from its quadratic maximum by {common_row['revenue_gap']:.4f}."
             )
+    regret = regret_table(results, lp_price_menus(results, common))
+    for _, row in results.iterrows():
+        own = regret[
+            (regret["Household"] == row["Household"]) & (regret["Menu"] == f"{row['Household']} LP prices")
+        ]
+        if own.empty or abs(float(own.iloc[0]["regret"])) > 1e-2:
+            failures.append(f"{row['Household']}: regret at its own LP prices is not zero.")
+        if (regret.loc[regret["Household"] == row["Household"], "regret"] < -1e-2).any():
+            failures.append(f"{row['Household']}: a menu beats the LP optimum, so regret went negative.")
     return failures
 
 
